@@ -1,7 +1,7 @@
 /* Simple Watch for Lampa. Local experimental plugin; no external telemetry. */
 (function (root) {
     'use strict';
-    var VERSION = '0.1.2';
+    var VERSION = '0.1.3';
     function norm(s) { return String(s || '').toLowerCase().replace(/ё/g, 'е').replace(/[^a-zа-я0-9]+/g, ' ').trim(); }
     function year(c) { return parseInt(c.year || String(c.release_date || c.first_air_date || c.alt_name || '').match(/(?:19|20)\d{2}/), 10) || 0; }
     function match(cards, movie) {
@@ -109,7 +109,7 @@
     function Screen(object) {
         var self = this, movie = object.movie || {}, dead = false, ready = false, active = false, last = null;
         var season = object.season || 1, episode = object.episode || 1, isSeries = !!(movie.name || movie.first_air_date || movie.original_name);
-        var fx = new Filmix(), generation = 0, torrentGeneration = 0, allStreams = [], post = null, profile = null, torrentTimer;
+        var fx = new Filmix(), generation = 0, torrentGeneration = 0, allStreams = [], post = null, profile = null, torrentTimer, accountButton, accountState = 'checking';
         var html = $('<div class="kvn-watch"></div>'), heading = $('<div class="kvn-heading"></div>').appendTo(html);
         $('<div class="kvn-title"></div>').text(movie.title || movie.name || 'Смотреть').appendTo(heading);
         var controls = $('<div class="kvn-controls"></div>').appendTo(heading);
@@ -128,14 +128,23 @@
         }
         function message(parent, text) { $('<div class="kvn-message"></div>').text(text).appendTo(parent); }
         function refreshFocus() { if (active && !dead && L.Controller.enabled().name === 'content') L.Controller.collectionSet(html); }
+        function crossColumn(direction) {
+            var from = direction === 'right' ? filmBody : torBody;
+            var to = direction === 'right' ? torBody : filmBody;
+            var rows = from.find('.selector'), index = rows.index(last);
+            if (index < 0) return false;
+            var targets = to.find('.selector');
+            if (targets.length) L.Controller.collectionFocus(targets.eq(Math.min(index, targets.length - 1))[0], html);
+            return true;
+        }
         function activate() {
             if (dead) return; active = true;
             L.Controller.add('content', {
                 toggle: function () { L.Controller.collectionSet(html); L.Controller.collectionFocus(last && $.contains(html[0], last) ? last : false, html); },
                 up: function () { if (root.Navigator.canmove('up')) root.Navigator.move('up'); else L.Controller.toggle('head'); },
                 down: function () { root.Navigator.move('down'); },
-                left: function () { if (root.Navigator.canmove('left')) root.Navigator.move('left'); else L.Controller.toggle('menu'); },
-                right: function () { root.Navigator.move('right'); },
+                left: function () { if (crossColumn('left')) return; if (root.Navigator.canmove('left')) root.Navigator.move('left'); else L.Controller.toggle('menu'); },
+                right: function () { if (!crossColumn('right')) root.Navigator.move('right'); },
                 back: function () { L.Activity.backward(); }
             });
             L.Controller.toggle('content');
@@ -145,12 +154,24 @@
             L.Select.show({title: title, items: items, onBack: activate, onSelect: function (item) { onSelect(item); activate(); }});
         }
         function account() { active = false; connectFilmix(activate, loadFilmix); }
+        function updateAccount() {
+            if (!accountButton) return;
+            var label = 'Проверка…', color = '#b8bdc8';
+            if (accountState === 'ok') {
+                label = profile.is_pro_plus ? 'PRO+ ✓' : profile.is_pro ? 'PRO ✓' : 'Нет подписки';
+                color = profile.is_pro_plus || profile.is_pro ? '#58df90' : '#ff8989';
+            } else if (accountState === 'login') { label = 'Войти'; color = '#ff8989'; }
+            else if (accountState === 'unknown') { label = 'Не проверено'; color = '#f5c96a'; }
+            accountButton.find('.kvn-account-badge').remove();
+            $('<span class="kvn-account-badge"></span>').text(label).css('color',color).appendTo(accountButton.find('.kvn-row-title'));
+        }
         function drawControls() {
             controls.empty();
-            action(controls, token() ? 'Аккаунт Filmix' : 'Подключить Filmix', '', function () {
+            accountButton = action(controls, 'Аккаунт Filmix', '', function () {
                 if (!token()) return account();
                 choose('Filmix', [{title: 'Проверить подписку', key: 'check'}, {title: 'Подключить другое устройство', key: 'connect'}], function (v) { if (v.key === 'connect') setTimeout(account, 0); else loadFilmix(); });
             });
+            updateAccount();
             if (isSeries) {
                 action(controls, 'Сезон ' + season, '', function () {
                     var ss = allStreams.map(function (r) { return r.season; }).filter(function (s, i, a) { return s > 0 && a.indexOf(s) === i; }).sort(function (a,b) { return a-b; });
@@ -175,7 +196,6 @@
         function drawStreams() {
             if (!post) return;
             filmBody.empty();
-            message(filmBody, profile && profile.is_pro_plus ? 'Подписка PRO+ подключена' : profile && profile.is_pro ? 'Подписка PRO подключена' : 'Аккаунт подключён. Доступное качество определяется Filmix.');
             var rows = allStreams.filter(function (r) { return !isSeries || r.season === season && r.episode === episode; });
             if (!rows.length) message(filmBody, 'Для выбранной серии нет доступных вариантов Filmix.');
             var voices = [];
@@ -198,13 +218,14 @@
         }
         function filmError() { filmBody.empty(); message(filmBody, 'Filmix сейчас не отвечает. Можно выбрать торрент или повторить запрос.'); action(filmBody, 'Повторить Filmix', '', loadFilmix); report('filmix_error'); refreshFocus(); }
         function loadFilmix() {
-            var gen = ++generation; post = null; allStreams = []; filmBody.empty(); drawControls();
+            var gen = ++generation; post = null; profile = null; accountState = token() ? 'checking' : 'login'; allStreams = []; filmBody.empty(); drawControls();
             if (!token()) { message(filmBody, 'Подключите свою подписку по коду устройства.'); action(filmBody, 'Подключить Filmix', '', account); refreshFocus(); return; }
             message(filmBody, 'Проверяем аккаунт Filmix…');
             fx.get('user_profile', {}, token(), function (p) {
                 if (dead || gen !== generation) return;
-                if (!p || !p.user_data || !p.user_data.login) { filmBody.empty(); message(filmBody, 'Нужно заново подключить Filmix.'); action(filmBody, 'Получить код устройства', '', account); refreshFocus(); return; }
+                if (!p || !p.user_data || !p.user_data.login) { accountState = 'login'; updateAccount(); filmBody.empty(); message(filmBody, 'Нужно заново подключить Filmix.'); action(filmBody, 'Получить код устройства', '', account); refreshFocus(); return; }
                 profile = p.user_data;
+                accountState = 'ok'; updateAccount();
                 fx.get('search', {story: movie.title || movie.name || movie.original_title}, token(), function (found) {
                     if (dead || gen !== generation) return;
                     var cards = Array.isArray(found) ? found : found && (found.results || found.data) || [], exact = match(cards, movie);
@@ -212,7 +233,7 @@
                     filmBody.empty(); message(filmBody, cards.length ? 'Уточните название в Filmix:' : 'Filmix не нашёл это название. Торренты доступны ниже.');
                     cards.slice(0, 12).forEach(function (c) { action(filmBody, c.title || c.name, String(year(c) || ''), function () { loadPost(c, gen); }); }); refreshFocus();
                 }, function () { if (!dead && gen === generation) filmError(); });
-            }, function () { if (!dead && gen === generation) filmError(); });
+            }, function () { if (!dead && gen === generation) { accountState = 'unknown'; updateAccount(); filmError(); } });
         }
         function loadTorrents() {
             clearTimeout(torrentTimer);
@@ -228,7 +249,7 @@
                 L.Parser.get({movie: m, search: m.original_title + suffix, search_one: m.title + suffix, search_two: m.original_title + suffix, page: 1}, function (data) {
                     clearTimeout(timeout); if (dead || gen !== torrentGeneration || ended) return; ended = true;
                     var rows = sortTorrents(data && data.Results || []); torBody.empty();
-                    if (isSeries) message(torBody, 'Раздачи сезона ' + season + '. Нужную серию выберите в списке файлов раздачи.');
+                    tor.find('h2').text(isSeries ? 'Торренты · сезон ' + season : 'Торренты');
                     if (!rows.length) message(torBody, 'Раздач не найдено.');
                     rows.slice(0, 40).forEach(function (r) {
                         var bytes = Number(r.Size) || 0, size = bytes ? (bytes / 1073741824).toFixed(1) + ' ГБ' : '';
@@ -268,6 +289,7 @@
         if (root.KVNWatch.ready) return; root.KVNWatch.ready = true;
         if (!L.Storage.get('kvn_watch_backup_v1', false)) L.Storage.set('kvn_watch_backup_v1', {created: Date.now(), plugins: L.Storage.get('plugins', []), enabled: L.Storage.get('kvn_watch_enabled', null)});
         $('<style>').text('.kvn-watch{height:100%;padding:1.4em 2em;box-sizing:border-box}.kvn-title{font-size:1.8em;font-weight:600;margin-bottom:.6em}.kvn-controls{display:flex;gap:.65em;margin-bottom:1em}.kvn-row{padding:.85em 1em;border-radius:.65em;background:rgba(255,255,255,.08);margin:.4em 0}.kvn-row.focus{background:#fff;color:#141820}.kvn-row-title{font-size:1.05em}.kvn-detail{opacity:.65;font-size:.8em;margin-top:.3em}.kvn-controls .kvn-row{font-size:.85em}.kvn-section{margin-bottom:1.6em}.kvn-section h2{font-size:1.3em;margin:0 0 .5em}.kvn-message{opacity:.72;padding:.6em 0 1em}.kvn-auth{line-height:1.5}').appendTo('head');
+        $('<style>').text('.kvn-section h2{height:1.6em;line-height:1.6em;margin:0 0 .5em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.kvn-section .kvn-row{height:6.5em;box-sizing:border-box;display:flex;flex-direction:column;justify-content:center}.kvn-section .kvn-row-title{line-height:1.15;display:-webkit-box;-webkit-box-orient:vertical;-webkit-line-clamp:3;overflow:hidden}.kvn-section .kvn-detail{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;flex-shrink:0}.kvn-account-badge{display:inline-block;margin-left:.65em;padding:.15em .45em;border-radius:.4em;background:#20262c;font-size:.85em}').appendTo('head');
         L.Component.add('kvn_watch', Screen); L.Listener.follow('full', attach);
         if (L.SettingsApi) {
             L.SettingsApi.addComponent({component: 'kvn_watch_settings', name: 'Простой просмотр', icon: '<svg viewBox="0 0 24 24"><path fill="currentColor" d="M7 3v18l14-9z"/></svg>'});
