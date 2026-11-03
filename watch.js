@@ -1,7 +1,7 @@
 /* Simple Watch for Lampa. Local experimental plugin; no external telemetry. */
 (function (root) {
     'use strict';
-    var VERSION = '0.1.8';
+    var VERSION = '0.1.9';
     function movieKey(movie) { return (movie.source || 'tmdb') + ':' + (movie.original_name || movie.first_air_date || movie.name ? 'tv:' : 'movie:') + (movie.id || norm(movie.original_title || movie.original_name || movie.title || movie.name) + ':' + year(movie)); }
     function selectedEpisode(saved, requestedSeason, requestedEpisode) {
         var season = Number(requestedSeason) || Number(saved.season) || 1;
@@ -115,7 +115,13 @@
             if (seen[key]) return false; seen[key] = true; return true;
         }).sort(function (a, b) { return (+b.Seeders || 0) - (+a.Seeders || 0); });
     }
-    var pure = {norm: norm, year: year, match: match, streams: streams, cap: cap, sortTorrents: sortTorrents, movieKey:movieKey, selectedEpisode:selectedEpisode, progressLabel:progressLabel, torrentBadges:torrentBadges,voiceMark:voiceMark,voiceSelection:voiceSelection};
+    function usedTorrent(record,identity) {return record.torrent===identity || !!(record.torrentsUsed || {})[identity];}
+    function prioritizeTorrents(rows,record,identify) {
+        var used=[],other=[];
+        rows.forEach(function(row){(usedTorrent(record,identify(row)) ? used : other).push(row);});
+        return used.concat(other);
+    }
+    var pure = {norm: norm, year: year, match: match, streams: streams, cap: cap, sortTorrents: sortTorrents, movieKey:movieKey, selectedEpisode:selectedEpisode, progressLabel:progressLabel, torrentBadges:torrentBadges,voiceMark:voiceMark,voiceSelection:voiceSelection,prioritizeTorrents:prioritizeTorrents,usedTorrent:usedTorrent};
     if (typeof module === 'object' && module.exports) { module.exports = pure; return; }
     if (root.KVNWatch) return;
     var L, $, API = 'http://filmixapp.cyou/api/v2/', watchCards = new WeakMap();
@@ -430,19 +436,20 @@
             try {
                 L.Parser.get({movie: m, search: m.original_title + suffix, search_one: m.title + suffix, search_two: m.original_title + suffix, page: 1}, function (data) {
                     clearTimeout(timeout); if (dead || gen !== torrentGeneration || ended) return; ended = true;
-                    var rows = sortTorrents(data && data.Results || []); torBody.empty();
+                    var rows = prioritizeTorrents(sortTorrents(data && data.Results || []),historyRead(historyKey),metadataIdentity); torBody.empty();
                     tor.find('h2').text(isSeries ? 'Торренты · сезон ' + season : 'Торренты');
                     if (!rows.length) message(torBody, 'Раздач не найдено.');
                     rows.slice(0, 40).forEach(function (r) {
                         var bytes = Number(r.Size) || 0, size = bytes ? (bytes / 1073741824).toFixed(1) + ' ГБ' : '';
                         var identity=metadataIdentity(r);
                         var tile=action(torBody, r.Title || 'Раздача', [size, 'Раздают: ' + (+r.Seeders || 0), r.Tracker || ''].filter(Boolean).join(' · '), function () {
-                            remember({source:'Торренты',torrent:identity});pendingTorrent={key:historyKey,identity:identity};
+                            var used=Object.assign({},historyRead(historyKey).torrentsUsed || {});used[identity]=true;
+                            remember({source:'Торренты',torrent:identity,torrentsUsed:used});pendingTorrent={key:historyKey,identity:identity};
                             L.Torrent.back(function () {var recent=historyRead(historyKey);if(isSeries){season=recent.season || season;episode=recent.episode || episode;}drawControls();activate();}); L.Torrent.start(r, movie);
                         });
                         var badges=$('<div class="kvn-tags"></div>').insertAfter(tile.find('.kvn-row-title'));
                         rowBadges(r,movie).forEach(function (b) {$('<span class="kvn-tag"></span>').addClass('kvn-tag-'+b.kind).text(b.label).appendTo(badges);});
-                        if(historyRead(historyKey).torrent===identity) $('<span class="kvn-tag kvn-tag-history"></span>').text('Выбирали').appendTo(badges);
+                        if(usedTorrent(historyRead(historyKey),identity)) $('<span class="kvn-tag kvn-tag-history"></span>').text('Выбирали').appendTo(badges);
                     });
                     report('torrent_results', {count: rows.length}); refreshFocus();
                 }, fail);
