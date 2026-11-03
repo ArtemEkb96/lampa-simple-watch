@@ -1,7 +1,7 @@
 /* Simple Watch for Lampa. Local experimental plugin; no external telemetry. */
 (function (root) {
     'use strict';
-    var VERSION = '0.1.5';
+    var VERSION = '0.1.6';
     function movieKey(movie) { return (movie.source || 'tmdb') + ':' + (movie.original_name || movie.first_air_date || movie.name ? 'tv:' : 'movie:') + (movie.id || norm(movie.original_title || movie.original_name || movie.title || movie.name) + ':' + year(movie)); }
     function selectedEpisode(saved, requestedSeason, requestedEpisode) {
         var season = Number(requestedSeason) || Number(saved.season) || 1;
@@ -15,25 +15,44 @@
     }
     function torrentBadges(row, movie) {
         var title = String(row.Title || ''), general = row.general || {}, info = row.info || {};
-        var streams = Array.isArray(row.ffprobe) ? row.ffprobe : [];
-        var video = streams.filter(function (s) {return s.codec_type === 'video';})[0] || {};
-        var text = title + ' ' + String(general.resolution || '') + ' ' + String(info.quality || '');
+        var streams = Array.isArray(row.ffprobe) ? row.ffprobe : row.ffprobe && row.ffprobe.streams || [];
+        var video = streams.filter(function (s) {return s.codec_type === 'video' && !/^(mjpeg|png)$/.test(s.codec_name || '') && !(s.disposition && s.disposition.attached_pic);})[0] || {};
+        var text = String(general.resolution || info.quality || title);
         var badges = [], add = function (label, kind) {badges.push({label:label,kind:kind});};
-        if (/\b(?:2160p?|4k|uhd)\b/i.test(text) || Number(video.width) >= 3800) add('4K','quality');
+        var width=Number(video.width || video.coded_width), height=Number(video.height || video.coded_height);
+        var dimensions=String(general.resolution || '').match(/(\d{3,5})\s*[x×х]\s*(\d{3,5})/i);
+        if(!width && !height && dimensions){width=+dimensions[1];height=+dimensions[2];}
+        if (width || height) {
+            add(width>=3800 || height>=2100 ? '4K' : width>=2500 || height>=1400 ? '1440p' : width>=1900 || height>=1000 ? '1080p' : width>=1260 || height>=700 ? '720p' : 'SD','quality');
+            if(width && height) add(width+'×'+height,'quality');
+        }
+        else if (/\b(?:2160p?|4k|uhd)\b/i.test(text)) add('4K','quality');
         else if (/\b1080[pi]?\b/i.test(text) || Number(video.width) >= 1900) add('1080p','quality');
         else if (/\b720p?\b/i.test(text) || Number(video.width) >= 1260) add('720p','quality');
         else if (/\b1440p?\b/i.test(text)) add('1440p','quality');
+        else if (/\b(?:SD|[345]80p?|576p?)\b/i.test(text)) add('SD','quality');
+        var technical=JSON.stringify(video.side_data_list || []);
+        if (width && height) {
+            if (/HDR10\+|SMPTE2094|dynamic.hdr.plus/i.test(technical)) add('HDR10+','hdr');
+            else if (video.color_transfer==='smpte2084') add('HDR10','hdr');
+            else if (video.color_transfer==='arib-std-b67') add('HLG','hdr');
+            if (/dovi|dolby.?vision/i.test(technical) || /dvhe|dvh1/.test(video.codec_tag_string || '')) add('Dolby Vision','hdr');
+        }
+        else {
         if (/HDR10\s*\+|HDR10Plus/i.test(title)) add('HDR10+','hdr');
         else if (/HDR10/i.test(title)) add('HDR10','hdr');
         else if (/\bHDR\b/i.test(title) || general.hdr) add('HDR','hdr');
         if (/Dolby\s*Vision|\bDV\b|\bDoVi\b/i.test(title)) add('Dolby Vision','hdr');
         if (/\bSDR\b/i.test(title)) add('SDR','neutral');
-        if (/HEVC|[hx][ .-]?265/i.test(title+' '+video.codec_name)) add('HEVC','codec');
+        }
+        if (video.codec_name) add(({hevc:'HEVC',h264:'H.264',mpeg4:'MPEG-4',av1:'AV1',mpeg2video:'MPEG-2'})[video.codec_name] || video.codec_name.toUpperCase(),'codec');
+        else if (/HEVC|[hx][ .-]?265/i.test(title)) add('HEVC','codec');
         else if (/AV1/i.test(title+' '+video.codec_name)) add('AV1','codec');
         else if (/[hx][ .-]?264|\bAVC\b/i.test(title+' '+video.codec_name)) add('H.264','codec');
         var rate = title.match(/(\d+(?:[.,]\d+)?)\s*(?:Mbps|Mbit\/s|Мбит\/с|Мб\/с)/i);
-        if (rate) add(rate[1].replace(',','.')+' Мбит/с','rate');
-        else if (Number(video.bit_rate)>0) add((Number(video.bit_rate)/1e6).toFixed(1)+' Мбит/с видео','rate');
+        var tags=video.tags || {}, bps=Number(video.bit_rate || tags.BPS || tags['BPS-eng'] || tags['BPS-en']);
+        if (bps>0) add((bps/1e6).toFixed(1)+' Мбит/с видео','rate');
+        else if (rate && !width) add(rate[1].replace(',','.')+' Мбит/с','rate');
         else if (!(movie.name || movie.original_name || movie.first_air_date) && Number(movie.runtime)>0 && Number(row.Size)>0) {
             add('≈ '+(Number(row.Size)*8/(Number(movie.runtime)*60*1e6)).toFixed(1)+' Мбит/с','rate');
         }
@@ -102,19 +121,54 @@
         var record = historyRead(key); Object.keys(changes).forEach(function (k) {record[k]=changes[k];});
         record.updated=Date.now(); L.Storage.set(key,record); return record;
     }
+    function rememberPlayback(data) {
+        var movie=data && data.card;
+        if (!movie) return;
+        var key=historyStorage(movie), old=historyRead(key);
+        if (!data.kvnWatch && (!pendingTorrent || pendingTorrent.key!==key)) return;
+        var s=Number(data.season) || Number(data.timeline && data.timeline.season) || 0;
+        var e=Number(data.episode) || Number(data.timeline && data.timeline.episode) || 0;
+        if ((movie.original_name || movie.first_air_date || movie.name) && (!s || !e)) return;
+        var ep=s+':'+e, episodes=old.episodes || {};
+        episodes[ep]=Object.assign({},episodes[ep],{launched:true,source:data.kvnWatch ? 'Filmix' : 'Торренты'});
+        historyWrite(key,{season:s,episode:e,episodes:episodes,source:data.kvnWatch ? 'Filmix' : 'Торренты'});
+        if (data.timeline && data.timeline.hash) trackedTimelines[data.timeline.hash]={key:key,episode:ep};
+    }
+    function metadataIdentity(row) {return String(L.Utils.hash(row.MagnetUri || row.Guid || row.Link || row.Title));}
+    function cachedMedia(row) {
+        var cache=L.Storage.get('mediainfo_cache_v2',{}), keys=[row.Link,row.link,row.MagnetUri,row.url];
+        for(var i=0;i<keys.length;i++) {
+            var rows=keys[i] && cache[keys[i]];
+            if(Array.isArray(rows) && rows.length && rows.length<=16) return rows.filter(function(r){return r && r.c==='v' && typeof r.t==='string';}).map(function(r){return {label:r.t.slice(0,200),kind:'quality'};});
+        }
+        return [];
+    }
+    function rowBadges(row,movie) {
+        if(row.ffprobe && (Array.isArray(row.ffprobe) ? row.ffprobe.length : row.ffprobe.streams && row.ffprobe.streams.length)) return torrentBadges(row,movie);
+        var cached=cachedMedia(row);
+        if(cached.length) return cached;
+        var learned=L.Storage.get('kvn_watch_media_v1:'+metadataIdentity(row),{});
+        if(learned.badges && learned.badges.length) return learned.badges.concat([{label:learned.fileLabel || 'Из выбранного файла',kind:'neutral'}]);
+        return torrentBadges(row,movie);
+    }
     function installHistory() {
+        if (L.Player && L.Player.listener) L.Player.listener.follow('external',function(data){rememberPlayback(data.data || data);});
+        if (L.Listener) L.Listener.follow('torrent_file',function(event){
+            var data=event.element;
+            if(!data || !pendingTorrent || !data.card || historyStorage(data.card)!==pendingTorrent.key) return;
+            if(event.type==='onenter') rememberPlayback(data);
+            if(event.type==='render' && event.item) {
+                // Capture the file chosen with the remote, even before an external player opens.
+                event.item.on('hover:enter.kvnHistory',function(){rememberPlayback(data);});
+            }
+            if(event.type!=='onenter' || !pendingTorrent.identity) return;
+            var rows=[];
+            if(event.item) event.item.find('.mi-v').each(function(){var t=$(this).text();if(t) rows.push({label:t.slice(0,200),kind:'quality'});});
+            if(!rows.length && data.ffprobe) rows=torrentBadges({ffprobe:data.ffprobe},data.card);
+            if(rows.length) L.Storage.set('kvn_watch_media_v1:'+pendingTorrent.identity,{badges:rows.slice(0,8),fileLabel:data.episode ? 'С'+data.season+' · серия '+data.episode : 'Из выбранного файла'});
+        });
         if (L.Player && L.Player.listener) L.Player.listener.follow('create', function (event) {
-            var data=event.data || {}, movie=data.card;
-            if (!movie) return;
-            var key=historyStorage(movie), old=historyRead(key);
-            if (!data.kvnWatch && (!pendingTorrent || pendingTorrent.key!==key)) return;
-            var s=Number(data.season) || Number(data.timeline && data.timeline.season) || 0;
-            var e=Number(data.episode) || Number(data.timeline && data.timeline.episode) || 0;
-            if ((movie.original_name || movie.first_air_date || movie.name) && (!s || !e)) return;
-            var ep=s+':'+e, episodes=old.episodes || {};
-            episodes[ep]=Object.assign({},episodes[ep],{launched:true,source:data.kvnWatch ? 'Filmix' : 'Торренты'});
-            historyWrite(key,{season:s,episode:e,episodes:episodes,source:data.kvnWatch ? 'Filmix' : 'Торренты'});
-            if (data.timeline && data.timeline.hash) trackedTimelines[data.timeline.hash]={key:key,episode:ep};
+            rememberPlayback(event.data || event);
         });
         if (L.Timeline && L.Timeline.listener) L.Timeline.listener.follow('update', function (event) {
             var data=event.data || {}, target=trackedTimelines[data.hash];
@@ -347,13 +401,13 @@
                     if (!rows.length) message(torBody, 'Раздач не найдено.');
                     rows.slice(0, 40).forEach(function (r) {
                         var bytes = Number(r.Size) || 0, size = bytes ? (bytes / 1073741824).toFixed(1) + ' ГБ' : '';
-                        var identity=String(L.Utils.hash(r.MagnetUri || r.Guid || r.Link || r.Title));
+                        var identity=metadataIdentity(r);
                         var tile=action(torBody, r.Title || 'Раздача', [size, 'Раздают: ' + (+r.Seeders || 0), r.Tracker || ''].filter(Boolean).join(' · '), function () {
-                            remember({source:'Торренты',torrent:identity});pendingTorrent={key:historyKey};
+                            remember({source:'Торренты',torrent:identity});pendingTorrent={key:historyKey,identity:identity};
                             L.Torrent.back(function () {var recent=historyRead(historyKey);if(isSeries){season=recent.season || season;episode=recent.episode || episode;}drawControls();activate();}); L.Torrent.start(r, movie);
                         });
                         var badges=$('<div class="kvn-tags"></div>').insertAfter(tile.find('.kvn-row-title'));
-                        torrentBadges(r,movie).forEach(function (b) {$('<span class="kvn-tag"></span>').addClass('kvn-tag-'+b.kind).text(b.label).appendTo(badges);});
+                        rowBadges(r,movie).forEach(function (b) {$('<span class="kvn-tag"></span>').addClass('kvn-tag-'+b.kind).text(b.label).appendTo(badges);});
                         if(historyRead(historyKey).torrent===identity) $('<span class="kvn-tag kvn-tag-history"></span>').text('Выбирали').appendTo(badges);
                     });
                     report('torrent_results', {count: rows.length}); refreshFocus();
@@ -362,7 +416,17 @@
         }
         this.create = function () { return html; };
         this.render = function () { return html; };
-        this.start = function () { activate(); updateProgress(); if (!ready) { ready = true; loadFilmix(); loadTorrents(); if (self.activity) self.activity.loader(false); } };
+        this.start = function () {
+            if(ready && isSeries) {
+                var recent=selectedEpisode(historyRead(historyKey));
+                if(recent.season!==season || recent.episode!==episode) {
+                    var changedSeason=recent.season!==season;
+                    season=recent.season;episode=recent.episode;drawControls();drawStreams();
+                    if(changedSeason) loadTorrents();
+                }
+            }
+            activate(); updateProgress(); if (!ready) { ready = true; loadFilmix(); loadTorrents(); if (self.activity) self.activity.loader(false); }
+        };
         this.pause = function () { active = false; };
         this.stop = function () { active = false; };
         this.destroy = function () { dead = true; active = false; clearTimeout(torrentTimer); fx.destroy(); scroll.destroy(); html.remove(); };
