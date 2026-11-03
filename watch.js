@@ -1,7 +1,7 @@
 /* Simple Watch for Lampa. Local experimental plugin; no external telemetry. */
 (function (root) {
     'use strict';
-    var VERSION = '0.1.3';
+    var VERSION = '0.1.4';
     function norm(s) { return String(s || '').toLowerCase().replace(/ё/g, 'е').replace(/[^a-zа-я0-9]+/g, ' ').trim(); }
     function year(c) { return parseInt(c.year || String(c.release_date || c.first_air_date || c.alt_name || '').match(/(?:19|20)\d{2}/), 10) || 0; }
     function match(cards, movie) {
@@ -50,7 +50,7 @@
     var pure = {norm: norm, year: year, match: match, streams: streams, cap: cap, sortTorrents: sortTorrents};
     if (typeof module === 'object' && module.exports) { module.exports = pure; return; }
     if (root.KVNWatch) return;
-    var L, $, API = 'http://filmixapp.cyou/api/v2/';
+    var L, $, API = 'http://filmixapp.cyou/api/v2/', watchCards = new WeakMap();
     function report() {} // Release builds do not send diagnostic events.
     function enabled() { return L.Storage.get('kvn_watch_enabled', true) !== false; }
     function token() { return L.Storage.get('kvn_watch_filmix_token', '') || L.Storage.get('filmix_token', '') || ''; }
@@ -269,19 +269,36 @@
     function open(movie, context) { L.Activity.push({component: 'kvn_watch', title: 'Смотреть', movie: movie, season: context && context.season, page: 1}); }
     function attach(e) {
         if (e.type !== 'complite' || !e.data || !e.data.movie) return;
-        function bind() {
-            var body = e.body || (e.object && e.object.activity && e.object.activity.render()); if (!body) return;
-            $(body).find('.button--play').each(function () {
-                var btn = $(this); if (btn.data('kvn-watch-bound')) return;
-                var events = $._data ? $._data(this, 'events') : null;
-                var originals = events && events['hover:enter'] ? events['hover:enter'].slice() : [];
-                btn.data('kvn-watch-bound', true).off('hover:enter').on('hover:enter.kvnwatch', function (event, ctx) {
-                    if (enabled()) open(e.data.movie, ctx);
-                    else originals.forEach(function (handler) { handler.handler.call(btn[0], event, ctx); });
-                });
-            });
+        var body = e.body || (e.object && e.object.activity && e.object.activity.render());
+        if (body) $(body).each(function () { watchCards.set(this, e.data.movie); });
+    }
+    function watchMovie(target) {
+        if (!target || target.nodeType !== 1 || !enabled()) return null;
+        var button = target.closest('.button--play');
+        if (!button) return null;
+        for (var node = button; node; node = node.parentElement) {
+            if (watchCards.has(node)) return watchCards.get(node);
         }
-        setTimeout(bind, 50); setTimeout(bind, 500);
+        return null;
+    }
+    function installWatchRouting() {
+        // Lampa dispatches a non-bubbling native event. Capture survives its
+        // button.unbind(), late source registration, and button replacement.
+        document.addEventListener('hover:enter', function (event) {
+            var movie = watchMovie(event.target);
+            if (!movie) return;
+            event.preventDefault(); event.stopImmediatePropagation();
+            open(movie, event.detail);
+        }, true);
+        // Some extensions instead use jQuery.trigger(), which has no native
+        // capture phase. Intercept only mapped Watch buttons; preserve others.
+        var special = $.event.special['hover:enter'] || ($.event.special['hover:enter'] = {});
+        var previous = special.trigger;
+        special.trigger = function (event, context) {
+            var movie = watchMovie(this);
+            if (movie) { open(movie, context); return false; }
+            if (previous) return previous.apply(this, arguments);
+        };
     }
     function init() {
         L = root.Lampa; $ = root.jQuery || root.$;
@@ -290,7 +307,7 @@
         if (!L.Storage.get('kvn_watch_backup_v1', false)) L.Storage.set('kvn_watch_backup_v1', {created: Date.now(), plugins: L.Storage.get('plugins', []), enabled: L.Storage.get('kvn_watch_enabled', null)});
         $('<style>').text('.kvn-watch{height:100%;padding:1.4em 2em;box-sizing:border-box}.kvn-title{font-size:1.8em;font-weight:600;margin-bottom:.6em}.kvn-controls{display:flex;gap:.65em;margin-bottom:1em}.kvn-row{padding:.85em 1em;border-radius:.65em;background:rgba(255,255,255,.08);margin:.4em 0}.kvn-row.focus{background:#fff;color:#141820}.kvn-row-title{font-size:1.05em}.kvn-detail{opacity:.65;font-size:.8em;margin-top:.3em}.kvn-controls .kvn-row{font-size:.85em}.kvn-section{margin-bottom:1.6em}.kvn-section h2{font-size:1.3em;margin:0 0 .5em}.kvn-message{opacity:.72;padding:.6em 0 1em}.kvn-auth{line-height:1.5}').appendTo('head');
         $('<style>').text('.kvn-section h2{height:1.6em;line-height:1.6em;margin:0 0 .5em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.kvn-section .kvn-row{height:6.5em;box-sizing:border-box;display:flex;flex-direction:column;justify-content:center}.kvn-section .kvn-row-title{line-height:1.15;display:-webkit-box;-webkit-box-orient:vertical;-webkit-line-clamp:3;overflow:hidden}.kvn-section .kvn-detail{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;flex-shrink:0}.kvn-account-badge{display:inline-block;margin-left:.65em;padding:.15em .45em;border-radius:.4em;background:#20262c;font-size:.85em}').appendTo('head');
-        L.Component.add('kvn_watch', Screen); L.Listener.follow('full', attach);
+        L.Component.add('kvn_watch', Screen); installWatchRouting(); L.Listener.follow('full', attach);
         if (L.SettingsApi) {
             L.SettingsApi.addComponent({component: 'kvn_watch_settings', name: 'Простой просмотр', icon: '<svg viewBox="0 0 24 24"><path fill="currentColor" d="M7 3v18l14-9z"/></svg>'});
             L.SettingsApi.addParam({component: 'kvn_watch_settings', param: {name: 'kvn_watch_enabled', type: 'trigger', default: true}, field: {name: 'Filmix и торренты по кнопке «Смотреть»', description: 'Выключите, чтобы вернуть прежнее меню источников.'}});
