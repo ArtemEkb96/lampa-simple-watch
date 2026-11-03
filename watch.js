@@ -1,7 +1,7 @@
 /* Simple Watch for Lampa. Local experimental plugin; no external telemetry. */
 (function (root) {
     'use strict';
-    var VERSION = '0.1.6';
+    var VERSION = '0.1.7';
     function movieKey(movie) { return (movie.source || 'tmdb') + ':' + (movie.original_name || movie.first_air_date || movie.name ? 'tv:' : 'movie:') + (movie.id || norm(movie.original_title || movie.original_name || movie.title || movie.name) + ':' + year(movie)); }
     function selectedEpisode(saved, requestedSeason, requestedEpisode) {
         var season = Number(requestedSeason) || Number(saved.season) || 1;
@@ -12,6 +12,12 @@
         if (record.manualSet ? record.manualDone : Number(record.percent) >= 90) return '✓ Просмотрено';
         if (Number(record.percent) > 0) return '▶ ' + Math.round(record.percent) + '%';
         return record.launched ? 'Запускали' : '';
+    }
+    function voiceMark(record, voice) {
+        var last=(record.voices || {})['voice:'+voice];
+        if(!last) return null;
+        var status=progressLabel(last) || 'Запускали';
+        return {label:status+(last.season ? ': сезон '+last.season+' · серия '+last.episode : ''),done:last.manualSet ? !!last.manualDone : Number(last.percent)>=90};
     }
     function torrentBadges(row, movie) {
         var title = String(row.Title || ''), general = row.general || {}, info = row.info || {};
@@ -104,7 +110,7 @@
             if (seen[key]) return false; seen[key] = true; return true;
         }).sort(function (a, b) { return (+b.Seeders || 0) - (+a.Seeders || 0); });
     }
-    var pure = {norm: norm, year: year, match: match, streams: streams, cap: cap, sortTorrents: sortTorrents, movieKey:movieKey, selectedEpisode:selectedEpisode, progressLabel:progressLabel, torrentBadges:torrentBadges};
+    var pure = {norm: norm, year: year, match: match, streams: streams, cap: cap, sortTorrents: sortTorrents, movieKey:movieKey, selectedEpisode:selectedEpisode, progressLabel:progressLabel, torrentBadges:torrentBadges,voiceMark:voiceMark};
     if (typeof module === 'object' && module.exports) { module.exports = pure; return; }
     if (root.KVNWatch) return;
     var L, $, API = 'http://filmixapp.cyou/api/v2/', watchCards = new WeakMap();
@@ -132,7 +138,13 @@
         var ep=s+':'+e, episodes=old.episodes || {};
         episodes[ep]=Object.assign({},episodes[ep],{launched:true,source:data.kvnWatch ? 'Filmix' : 'Торренты'});
         historyWrite(key,{season:s,episode:e,episodes:episodes,source:data.kvnWatch ? 'Filmix' : 'Торренты'});
-        if (data.timeline && data.timeline.hash) trackedTimelines[data.timeline.hash]={key:key,episode:ep};
+        var voice=data.kvnWatch && data.kvnVoice;
+        if(voice) {
+            var voices=old.voices || {}, previous=voices['voice:'+voice];
+            voices['voice:'+voice]=Object.assign({},previous && previous.season===s && previous.episode===e ? previous : {},{season:s,episode:e,launched:true});
+            historyWrite(key,{voices:voices});
+        }
+        if (data.timeline && data.timeline.hash) trackedTimelines[data.timeline.hash]={key:key,episode:ep,voice:voice};
     }
     function metadataIdentity(row) {return String(L.Utils.hash(row.MagnetUri || row.Guid || row.Link || row.Title));}
     function cachedMedia(row) {
@@ -176,6 +188,11 @@
             var record=historyRead(target.key), episodes=record.episodes || {};
             episodes[target.episode]=Object.assign({},episodes[target.episode],{percent:data.road.percent,time:data.road.time,duration:data.road.duration});
             historyWrite(target.key,{episodes:episodes});
+            var voices=record.voices || {}, last=voices['voice:'+target.voice];
+            if(target.voice && last && last.season+':'+last.episode===target.episode) {
+                Object.assign(last,{percent:data.road.percent,time:data.road.time,duration:data.road.duration});
+                historyWrite(target.key,{voices:voices});
+            }
         });
     }
     function token() { return L.Storage.get('kvn_watch_filmix_token', '') || L.Storage.get('filmix_token', '') || ''; }
@@ -323,7 +340,9 @@
                 choose('Отметка просмотра', [{title:'Отметить просмотренным',done:true},{title:'Отметить непросмотренным',done:false}], function (v) {
                     var record=historyRead(historyKey), episodes=record.episodes || {};
                     episodes[episodeId()]=Object.assign({},episodes[episodeId()],{manualDone:v.done,manualSet:true});
-                    historyWrite(historyKey,{episodes:episodes});updateProgress();
+                    var voices=record.voices || {}, last=voices['voice:'+record.voice];
+                    if(record.source==='Filmix' && last && last.season===season && last.episode===episode) Object.assign(last,{manualDone:v.done,manualSet:true});
+                    historyWrite(historyKey,{episodes:episodes,voices:voices});updateProgress();updateVoiceMarks();
                 });
             });
             action(controls, 'Обновить', '', function () { loadFilmix(); loadTorrents(); }); updateProgress();refreshFocus();
@@ -331,7 +350,7 @@
         function playFilmix(row) {
             var variants = allStreams.filter(function (r) { return r.voice === row.voice && r.season === row.season && r.episode === row.episode; });
             var q = {}; variants.forEach(function (r) { q[r.quality + 'p'] = r.url; });
-            var entry = {title: (movie.title || movie.name) + (row.season ? ' · ' + row.season + ' сезон, ' + row.episode + ' серия' : '') + ' · ' + row.voice, url: row.url, quality: q, card:movie,season:row.season,episode:row.episode,kvnWatch:true};
+            var entry = {title: (movie.title || movie.name) + (row.season ? ' · ' + row.season + ' сезон, ' + row.episode + ' серия' : '') + ' · ' + row.voice, url: row.url, quality: q, card:movie,season:row.season,episode:row.episode,kvnWatch:true,kvnVoice:row.voice};
             remember({source:'Filmix',voice:row.voice,quality:row.quality});
             if (L.Timeline) {
                 var name=movie.original_title || movie.original_name || movie.title || movie.name;
@@ -340,6 +359,13 @@
             }
             if (movie.id) L.Favorite.add('history', movie, 100);
             L.Player.play(entry); L.Player.playlist([entry]);
+        }
+        function updateVoiceMarks() {
+            var record=historyRead(historyKey);
+            filmBody.find('.kvn-voice-mark').each(function(){
+                var item=$(this),mark=voiceMark(record,item.data('voice'));
+                item.text(mark ? mark.label : '').toggle(!!mark).toggleClass('kvn-tag-history',!!(mark && mark.done)).toggleClass('kvn-tag-quality',!!(mark && !mark.done));
+            });
         }
         function drawStreams() {
             if (!post) return;
@@ -351,10 +377,12 @@
                 if (voices.indexOf(r.voice) >= 0) return;
                 voices.push(r.voice);
                 var variants = rows.filter(function (v) { return v.voice === r.voice; }).sort(function (a,b) { return b.quality-a.quality; });
-                action(filmBody, r.voice, (historyRead(historyKey).voice===r.voice ? 'Выбирали · ' : '') + variants.map(function (v) { return v.quality === 2160 ? '4K' : v.quality + 'p'; }).join(' · '), function () {
+                var tile=action(filmBody, r.voice, variants.map(function (v) { return v.quality === 2160 ? '4K' : v.quality + 'p'; }).join(' · '), function () {
                     choose('Качество · ' + r.voice, variants.map(function (v) { return {title:v.quality === 2160 ? '4K' : v.quality + 'p', stream:v}; }), function (v) { playFilmix(v.stream); });
                 });
+                $('<div class="kvn-voice-mark kvn-tag" style="align-self:flex-start;margin-top:.4em"></div>').data('voice',r.voice).appendTo(tile);
             });
+            updateVoiceMarks();
             report('filmix_results', {count: rows.length}); refreshFocus();
         }
         function loadPost(card, gen) {
@@ -425,7 +453,7 @@
                     if(changedSeason) loadTorrents();
                 }
             }
-            activate(); updateProgress(); if (!ready) { ready = true; loadFilmix(); loadTorrents(); if (self.activity) self.activity.loader(false); }
+            activate(); updateProgress(); updateVoiceMarks(); if (!ready) { ready = true; loadFilmix(); loadTorrents(); if (self.activity) self.activity.loader(false); }
         };
         this.pause = function () { active = false; };
         this.stop = function () { active = false; };
