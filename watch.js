@@ -1,7 +1,45 @@
 /* Simple Watch for Lampa. Local experimental plugin; no external telemetry. */
 (function (root) {
     'use strict';
-    var VERSION = '0.1.4';
+    var VERSION = '0.1.5';
+    function movieKey(movie) { return (movie.source || 'tmdb') + ':' + (movie.original_name || movie.first_air_date || movie.name ? 'tv:' : 'movie:') + (movie.id || norm(movie.original_title || movie.original_name || movie.title || movie.name) + ':' + year(movie)); }
+    function selectedEpisode(saved, requestedSeason, requestedEpisode) {
+        var season = Number(requestedSeason) || Number(saved.season) || 1;
+        return {season:season, episode:Number(requestedEpisode) || (season === Number(saved.season) ? Number(saved.episode) : 0) || 1};
+    }
+    function progressLabel(record) {
+        if (!record) return '';
+        if (record.manualSet ? record.manualDone : Number(record.percent) >= 90) return '✓ Просмотрено';
+        if (Number(record.percent) > 0) return '▶ ' + Math.round(record.percent) + '%';
+        return record.launched ? 'Запускали' : '';
+    }
+    function torrentBadges(row, movie) {
+        var title = String(row.Title || ''), general = row.general || {}, info = row.info || {};
+        var streams = Array.isArray(row.ffprobe) ? row.ffprobe : [];
+        var video = streams.filter(function (s) {return s.codec_type === 'video';})[0] || {};
+        var text = title + ' ' + String(general.resolution || '') + ' ' + String(info.quality || '');
+        var badges = [], add = function (label, kind) {badges.push({label:label,kind:kind});};
+        if (/\b(?:2160p?|4k|uhd)\b/i.test(text) || Number(video.width) >= 3800) add('4K','quality');
+        else if (/\b1080[pi]?\b/i.test(text) || Number(video.width) >= 1900) add('1080p','quality');
+        else if (/\b720p?\b/i.test(text) || Number(video.width) >= 1260) add('720p','quality');
+        else if (/\b1440p?\b/i.test(text)) add('1440p','quality');
+        if (/HDR10\s*\+|HDR10Plus/i.test(title)) add('HDR10+','hdr');
+        else if (/HDR10/i.test(title)) add('HDR10','hdr');
+        else if (/\bHDR\b/i.test(title) || general.hdr) add('HDR','hdr');
+        if (/Dolby\s*Vision|\bDV\b|\bDoVi\b/i.test(title)) add('Dolby Vision','hdr');
+        if (/\bSDR\b/i.test(title)) add('SDR','neutral');
+        if (/HEVC|[hx][ .-]?265/i.test(title+' '+video.codec_name)) add('HEVC','codec');
+        else if (/AV1/i.test(title+' '+video.codec_name)) add('AV1','codec');
+        else if (/[hx][ .-]?264|\bAVC\b/i.test(title+' '+video.codec_name)) add('H.264','codec');
+        var rate = title.match(/(\d+(?:[.,]\d+)?)\s*(?:Mbps|Mbit\/s|Мбит\/с|Мб\/с)/i);
+        if (rate) add(rate[1].replace(',','.')+' Мбит/с','rate');
+        else if (Number(video.bit_rate)>0) add((Number(video.bit_rate)/1e6).toFixed(1)+' Мбит/с видео','rate');
+        else if (!(movie.name || movie.original_name || movie.first_air_date) && Number(movie.runtime)>0 && Number(row.Size)>0) {
+            add('≈ '+(Number(row.Size)*8/(Number(movie.runtime)*60*1e6)).toFixed(1)+' Мбит/с','rate');
+        }
+        if (!badges.some(function (b) {return b.kind === 'quality';})) add('Качество не указано','neutral');
+        return badges;
+    }
     function norm(s) { return String(s || '').toLowerCase().replace(/ё/g, 'е').replace(/[^a-zа-я0-9]+/g, ' ').trim(); }
     function year(c) { return parseInt(c.year || String(c.release_date || c.first_air_date || c.alt_name || '').match(/(?:19|20)\d{2}/), 10) || 0; }
     function match(cards, movie) {
@@ -47,12 +85,45 @@
             if (seen[key]) return false; seen[key] = true; return true;
         }).sort(function (a, b) { return (+b.Seeders || 0) - (+a.Seeders || 0); });
     }
-    var pure = {norm: norm, year: year, match: match, streams: streams, cap: cap, sortTorrents: sortTorrents};
+    var pure = {norm: norm, year: year, match: match, streams: streams, cap: cap, sortTorrents: sortTorrents, movieKey:movieKey, selectedEpisode:selectedEpisode, progressLabel:progressLabel, torrentBadges:torrentBadges};
     if (typeof module === 'object' && module.exports) { module.exports = pure; return; }
     if (root.KVNWatch) return;
     var L, $, API = 'http://filmixapp.cyou/api/v2/', watchCards = new WeakMap();
     function report() {} // Release builds do not send diagnostic events.
     function enabled() { return L.Storage.get('kvn_watch_enabled', true) !== false; }
+    var trackedTimelines = {}, pendingTorrent = null;
+    function historyStorage(movie) {
+        var permit = L.Account && L.Account.Permit;
+        var profile = permit && permit.sync && permit.account && permit.account.profile ? permit.account.profile.id : 'local';
+        return 'kvn_watch_history_v1:' + profile + ':' + movieKey(movie);
+    }
+    function historyRead(key) { return L.Storage.get(key, {episodes:{}}); }
+    function historyWrite(key, changes) {
+        var record = historyRead(key); Object.keys(changes).forEach(function (k) {record[k]=changes[k];});
+        record.updated=Date.now(); L.Storage.set(key,record); return record;
+    }
+    function installHistory() {
+        if (L.Player && L.Player.listener) L.Player.listener.follow('create', function (event) {
+            var data=event.data || {}, movie=data.card;
+            if (!movie) return;
+            var key=historyStorage(movie), old=historyRead(key);
+            if (!data.kvnWatch && (!pendingTorrent || pendingTorrent.key!==key)) return;
+            var s=Number(data.season) || Number(data.timeline && data.timeline.season) || 0;
+            var e=Number(data.episode) || Number(data.timeline && data.timeline.episode) || 0;
+            if ((movie.original_name || movie.first_air_date || movie.name) && (!s || !e)) return;
+            var ep=s+':'+e, episodes=old.episodes || {};
+            episodes[ep]=Object.assign({},episodes[ep],{launched:true,source:data.kvnWatch ? 'Filmix' : 'Торренты'});
+            historyWrite(key,{season:s,episode:e,episodes:episodes,source:data.kvnWatch ? 'Filmix' : 'Торренты'});
+            if (data.timeline && data.timeline.hash) trackedTimelines[data.timeline.hash]={key:key,episode:ep};
+        });
+        if (L.Timeline && L.Timeline.listener) L.Timeline.listener.follow('update', function (event) {
+            var data=event.data || {}, target=trackedTimelines[data.hash];
+            if (!target || !data.road) return;
+            var record=historyRead(target.key), episodes=record.episodes || {};
+            episodes[target.episode]=Object.assign({},episodes[target.episode],{percent:data.road.percent,time:data.road.time,duration:data.road.duration});
+            historyWrite(target.key,{episodes:episodes});
+        });
+    }
     function token() { return L.Storage.get('kvn_watch_filmix_token', '') || L.Storage.get('filmix_token', '') || ''; }
     function device() {
         var id = L.Storage.get('kvn_watch_device_id', '');
@@ -108,11 +179,13 @@
     }
     function Screen(object) {
         var self = this, movie = object.movie || {}, dead = false, ready = false, active = false, last = null;
-        var season = object.season || 1, episode = object.episode || 1, isSeries = !!(movie.name || movie.first_air_date || movie.original_name);
+        var historyKey=historyStorage(movie), saved=historyRead(historyKey), selection=selectedEpisode(saved,object.season,object.episode);
+        var season = selection.season, episode = selection.episode, isSeries = !!(movie.name || movie.first_air_date || movie.original_name);
         var fx = new Filmix(), generation = 0, torrentGeneration = 0, allStreams = [], post = null, profile = null, torrentTimer, accountButton, accountState = 'checking';
         var html = $('<div class="kvn-watch"></div>'), heading = $('<div class="kvn-heading"></div>').appendTo(html);
         $('<div class="kvn-title"></div>').text(movie.title || movie.name || 'Смотреть').appendTo(heading);
         var controls = $('<div class="kvn-controls"></div>').appendTo(heading);
+        var progress = $('<div class="kvn-progress"></div>').appendTo(heading);
         var scroll = new L.Scroll({mask: true, over: true}); html.append(scroll.render()); scroll.minus(heading);
         var film = $('<section class="kvn-section"><h2>Filmix</h2></section>'), tor = $('<section class="kvn-section"><h2>Торренты</h2></section>');
         var columns = $('<div style="display:flex;gap:1.2em;align-items:flex-start"></div>');
@@ -127,6 +200,14 @@
             return row;
         }
         function message(parent, text) { $('<div class="kvn-message"></div>').text(text).appendTo(parent); }
+        function episodeId() {return isSeries ? season+':'+episode : '0:0';}
+        function remember(changes) {historyWrite(historyKey,Object.assign({season:season,episode:episode},changes || {}));}
+        function updateProgress() {
+            var record=historyRead(historyKey), ep=(record.episodes || {})[episodeId()];
+            progress.text([isSeries ? 'Сезон '+season+' · серия '+episode : '',progressLabel(ep),ep && ep.source ? ep.source : record.source ? 'Последний источник: '+record.source : ''].filter(Boolean).join(' · '));
+            progress.toggleClass('kvn-done',progressLabel(ep)==='✓ Просмотрено');
+        }
+        function episodeTitle(s,e) {var item=(historyRead(historyKey).episodes || {})[s+':'+e];return 'Серия '+e+(progressLabel(item) ? ' · '+progressLabel(item) : '');}
         function refreshFocus() { if (active && !dead && L.Controller.enabled().name === 'content') L.Controller.collectionSet(html); }
         function crossColumn(direction) {
             var from = direction === 'right' ? filmBody : torBody;
@@ -176,20 +257,33 @@
                 action(controls, 'Сезон ' + season, '', function () {
                     var ss = allStreams.map(function (r) { return r.season; }).filter(function (s, i, a) { return s > 0 && a.indexOf(s) === i; }).sort(function (a,b) { return a-b; });
                     if (!ss.length) for (var i = 1; i <= (movie.number_of_seasons || 1); i++) ss.push(i);
-                    choose('Сезон', ss.map(function (s) { return {title: 'Сезон ' + s, value: s}; }), function (v) { season = v.value; episode = 1; drawControls(); drawStreams(); loadTorrents(); });
+                    choose('Сезон', ss.map(function (s) { return {title: 'Сезон ' + s, value: s}; }), function (v) { season = v.value; episode = 1; remember(); drawControls(); drawStreams(); loadTorrents(); });
                 });
                 action(controls, 'Серия ' + episode, '', function () {
                     var es = allStreams.filter(function (r) { return r.season === season; }).map(function (r) { return r.episode; }).filter(function (e,i,a) { return e > 0 && a.indexOf(e) === i; }).sort(function (a,b) {return a-b;});
                     if (!es.length) { L.Noty.show('Список серий появится после загрузки Filmix. В торрентах серия выбирается внутри раздачи.'); return; }
-                    choose('Серия', es.map(function (e) { return {title: 'Серия ' + e, value: e}; }), function (v) { episode = v.value; drawControls(); drawStreams(); });
+                    choose('Серия', es.map(function (e) { return {title: episodeTitle(season,e), value: e}; }), function (v) { episode = v.value; remember(); drawControls(); drawStreams(); });
                 });
             }
-            action(controls, 'Обновить', '', function () { loadFilmix(); loadTorrents(); }); refreshFocus();
+            action(controls, 'Отметка просмотра', '', function () {
+                choose('Отметка просмотра', [{title:'Отметить просмотренным',done:true},{title:'Отметить непросмотренным',done:false}], function (v) {
+                    var record=historyRead(historyKey), episodes=record.episodes || {};
+                    episodes[episodeId()]=Object.assign({},episodes[episodeId()],{manualDone:v.done,manualSet:true});
+                    historyWrite(historyKey,{episodes:episodes});updateProgress();
+                });
+            });
+            action(controls, 'Обновить', '', function () { loadFilmix(); loadTorrents(); }); updateProgress();refreshFocus();
         }
         function playFilmix(row) {
             var variants = allStreams.filter(function (r) { return r.voice === row.voice && r.season === row.season && r.episode === row.episode; });
             var q = {}; variants.forEach(function (r) { q[r.quality + 'p'] = r.url; });
-            var entry = {title: (movie.title || movie.name) + (row.season ? ' · ' + row.season + ' сезон, ' + row.episode + ' серия' : '') + ' · ' + row.voice, url: row.url, quality: q};
+            var entry = {title: (movie.title || movie.name) + (row.season ? ' · ' + row.season + ' сезон, ' + row.episode + ' серия' : '') + ' · ' + row.voice, url: row.url, quality: q, card:movie,season:row.season,episode:row.episode,kvnWatch:true};
+            remember({source:'Filmix',voice:row.voice,quality:row.quality});
+            if (L.Timeline) {
+                var name=movie.original_title || movie.original_name || movie.title || movie.name;
+                var hash=L.Utils.hash(row.season ? [row.season,row.episode,name].join('') : name);
+                entry.timeline=L.Timeline.view(hash,L.Timeline.link ? L.Timeline.link(movie,row.season,row.episode) : null);
+            }
             if (movie.id) L.Favorite.add('history', movie, 100);
             L.Player.play(entry); L.Player.playlist([entry]);
         }
@@ -203,7 +297,7 @@
                 if (voices.indexOf(r.voice) >= 0) return;
                 voices.push(r.voice);
                 var variants = rows.filter(function (v) { return v.voice === r.voice; }).sort(function (a,b) { return b.quality-a.quality; });
-                action(filmBody, r.voice, variants.map(function (v) { return v.quality === 2160 ? '4K' : v.quality + 'p'; }).join(' · '), function () {
+                action(filmBody, r.voice, (historyRead(historyKey).voice===r.voice ? 'Выбирали · ' : '') + variants.map(function (v) { return v.quality === 2160 ? '4K' : v.quality + 'p'; }).join(' · '), function () {
                     choose('Качество · ' + r.voice, variants.map(function (v) { return {title:v.quality === 2160 ? '4K' : v.quality + 'p', stream:v}; }), function (v) { playFilmix(v.stream); });
                 });
             });
@@ -253,7 +347,14 @@
                     if (!rows.length) message(torBody, 'Раздач не найдено.');
                     rows.slice(0, 40).forEach(function (r) {
                         var bytes = Number(r.Size) || 0, size = bytes ? (bytes / 1073741824).toFixed(1) + ' ГБ' : '';
-                        action(torBody, r.Title || 'Раздача', [size, 'Раздают: ' + (+r.Seeders || 0), r.Tracker || ''].filter(Boolean).join(' · '), function () { L.Torrent.back(activate); L.Torrent.start(r, movie); });
+                        var identity=String(L.Utils.hash(r.MagnetUri || r.Guid || r.Link || r.Title));
+                        var tile=action(torBody, r.Title || 'Раздача', [size, 'Раздают: ' + (+r.Seeders || 0), r.Tracker || ''].filter(Boolean).join(' · '), function () {
+                            remember({source:'Торренты',torrent:identity});pendingTorrent={key:historyKey};
+                            L.Torrent.back(function () {var recent=historyRead(historyKey);if(isSeries){season=recent.season || season;episode=recent.episode || episode;}drawControls();activate();}); L.Torrent.start(r, movie);
+                        });
+                        var badges=$('<div class="kvn-tags"></div>').insertAfter(tile.find('.kvn-row-title'));
+                        torrentBadges(r,movie).forEach(function (b) {$('<span class="kvn-tag"></span>').addClass('kvn-tag-'+b.kind).text(b.label).appendTo(badges);});
+                        if(historyRead(historyKey).torrent===identity) $('<span class="kvn-tag kvn-tag-history"></span>').text('Выбирали').appendTo(badges);
                     });
                     report('torrent_results', {count: rows.length}); refreshFocus();
                 }, fail);
@@ -261,12 +362,12 @@
         }
         this.create = function () { return html; };
         this.render = function () { return html; };
-        this.start = function () { activate(); if (!ready) { ready = true; loadFilmix(); loadTorrents(); if (self.activity) self.activity.loader(false); } };
+        this.start = function () { activate(); updateProgress(); if (!ready) { ready = true; loadFilmix(); loadTorrents(); if (self.activity) self.activity.loader(false); } };
         this.pause = function () { active = false; };
         this.stop = function () { active = false; };
         this.destroy = function () { dead = true; active = false; clearTimeout(torrentTimer); fx.destroy(); scroll.destroy(); html.remove(); };
     }
-    function open(movie, context) { L.Activity.push({component: 'kvn_watch', title: 'Смотреть', movie: movie, season: context && context.season, page: 1}); }
+    function open(movie, context) { L.Activity.push({component: 'kvn_watch', title: 'Смотреть', movie: movie, season: context && context.season, episode: context && context.episode, page: 1}); }
     function attach(e) {
         if (e.type !== 'complite' || !e.data || !e.data.movie) return;
         var body = e.body || (e.object && e.object.activity && e.object.activity.render());
@@ -307,7 +408,8 @@
         if (!L.Storage.get('kvn_watch_backup_v1', false)) L.Storage.set('kvn_watch_backup_v1', {created: Date.now(), plugins: L.Storage.get('plugins', []), enabled: L.Storage.get('kvn_watch_enabled', null)});
         $('<style>').text('.kvn-watch{height:100%;padding:1.4em 2em;box-sizing:border-box}.kvn-title{font-size:1.8em;font-weight:600;margin-bottom:.6em}.kvn-controls{display:flex;gap:.65em;margin-bottom:1em}.kvn-row{padding:.85em 1em;border-radius:.65em;background:rgba(255,255,255,.08);margin:.4em 0}.kvn-row.focus{background:#fff;color:#141820}.kvn-row-title{font-size:1.05em}.kvn-detail{opacity:.65;font-size:.8em;margin-top:.3em}.kvn-controls .kvn-row{font-size:.85em}.kvn-section{margin-bottom:1.6em}.kvn-section h2{font-size:1.3em;margin:0 0 .5em}.kvn-message{opacity:.72;padding:.6em 0 1em}.kvn-auth{line-height:1.5}').appendTo('head');
         $('<style>').text('.kvn-section h2{height:1.6em;line-height:1.6em;margin:0 0 .5em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.kvn-section .kvn-row{height:6.5em;box-sizing:border-box;display:flex;flex-direction:column;justify-content:center}.kvn-section .kvn-row-title{line-height:1.15;display:-webkit-box;-webkit-box-orient:vertical;-webkit-line-clamp:3;overflow:hidden}.kvn-section .kvn-detail{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;flex-shrink:0}.kvn-account-badge{display:inline-block;margin-left:.65em;padding:.15em .45em;border-radius:.4em;background:#20262c;font-size:.85em}').appendTo('head');
-        L.Component.add('kvn_watch', Screen); installWatchRouting(); L.Listener.follow('full', attach);
+        $('<style>').text('.kvn-progress{font-size:.85em;color:#9dccff;min-height:1.5em;margin-bottom:.5em}.kvn-progress.kvn-done{color:#58df90}.kvn-section .kvn-row{height:8em}.kvn-tags{display:flex;gap:.3em;flex-wrap:wrap;margin:.35em 0 .1em;flex-shrink:0}.kvn-tag{font-size:.68em;line-height:1.35;padding:.14em .4em;border-radius:.3em;background:#343b49;color:#d6dbe5}.kvn-tag-quality{background:#253e66;color:#a5d0ff}.kvn-tag-hdr{background:#514226;color:#ffe090}.kvn-tag-codec{background:#40315f;color:#d6bcff}.kvn-tag-rate{background:#214a45;color:#9aead8}.kvn-tag-history{background:#245536;color:#a2edb7}').appendTo('head');
+        L.Component.add('kvn_watch', Screen); installWatchRouting(); installHistory(); L.Listener.follow('full', attach);
         if (L.SettingsApi) {
             L.SettingsApi.addComponent({component: 'kvn_watch_settings', name: 'Простой просмотр', icon: '<svg viewBox="0 0 24 24"><path fill="currentColor" d="M7 3v18l14-9z"/></svg>'});
             L.SettingsApi.addParam({component: 'kvn_watch_settings', param: {name: 'kvn_watch_enabled', type: 'trigger', default: true}, field: {name: 'Filmix и торренты по кнопке «Смотреть»', description: 'Выключите, чтобы вернуть прежнее меню источников.'}});
