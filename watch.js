@@ -1,7 +1,7 @@
 /* Simple Watch for Lampa. Local experimental plugin; no external telemetry. */
 (function (root) {
     'use strict';
-    var VERSION = '0.1.10';
+    var VERSION = '0.1.11';
     function movieKey(movie) { return (movie.source || 'tmdb') + ':' + (movie.original_name || movie.first_air_date || movie.name ? 'tv:' : 'movie:') + (movie.id || norm(movie.original_title || movie.original_name || movie.title || movie.name) + ':' + year(movie)); }
     function selectedEpisode(saved, requestedSeason, requestedEpisode) {
         var season = Number(requestedSeason) || Number(saved.season) || 1;
@@ -124,7 +124,12 @@
         rx=/(?:^|[^a-zа-я0-9])(\d{1,2})(?:\s*[-–]\s*(\d{1,2}))?\s*(?:-?\s*(?:й|ый|ий|го|йо)\s*)?сезон(?:а|ы|ов)?/gi;
         while((m=rx.exec(text))) addRange(seasons,m[1],m[2]);
         rx=/сезон(?:а|ы|ов)?\s*[:№#]?\s*(\d{1,2})(?:\s*[-–]\s*(\d{1,2}))?/gi;
-        while((m=rx.exec(text))) addRange(seasons,m[1],m[2]);
+        while((m=rx.exec(text))) {
+            // In '1 сезон: 1-10 серии', numbers after the colon are episodes.
+            if (!/\d(?:\s*-?\s*(?:й|ый|ий|го|йо))?\s*$/.test(text.slice(0,m.index))) addRange(seasons,m[1],m[2]);
+        }
+        rx=/(?:^|[^a-zа-я0-9])(\d{1,2})\s*(?:-?\s*(?:й|ый|ий|го)\s*)?сезон(?:а)?\s*[:№#]\s*(\d{1,3})(?:\s*[-–]\s*(\d{1,3}))?\s*сер(?:ия|ии|ий)/gi;
+        while((m=rx.exec(text))) if(Number(m[1])===Number(wantedSeason)) addRange(episodes,m[2],m[3]);
         rx=/(?:^|[^a-zа-я0-9])(\d{1,2})x(\d{1,3})(?=$|[^0-9])/gi;
         while((m=rx.exec(text))) { addRange(seasons,m[1]); if(Number(m[1])===Number(wantedSeason)) addRange(episodes,m[2]); }
         rx=/(?:^|[^a-zа-я0-9])s(\d{1,2})e(\d{1,3})(?:\s*[-–]\s*e?(\d{1,3}))?/gi;
@@ -132,7 +137,8 @@
         // Compound episode lists such as S02E01E03 are ambiguous; never hide them.
         if(/s\d{1,2}e\d{1,3}(?:e\d{1,3}|\s*[+,/]\s*e\d{1,3})/i.test(text)) episodes=[];
         // Comma-separated season lists need inspection rather than an unsafe exclusion.
-        if(/сезон(?:а|ы|ов)?\s*[:№#]?\s*\d{1,2}\s*[,/+]/i.test(text)) return 'unknown';
+        var listMatch=/сезон(?:а|ы|ов)?\s*[:№#]?\s*\d{1,2}\s*[,/+]/i.exec(text);
+        if(listMatch && !/\d(?:\s*-?\s*(?:й|ый|ий|го|йо))?\s*$/.test(text.slice(0,listMatch.index))) return 'unknown';
         if(seasons.length && seasons.indexOf(Number(wantedSeason))<0) return 'other';
         if(episodes.length && episodes.indexOf(Number(wantedEpisode))<0) return 'other';
         return seasons.length ? 'match' : 'unknown';
@@ -462,7 +468,6 @@
         function renderTorrents() {
                     var result=displayTorrents(torrentRows || [],historyRead(historyKey),metadataIdentity,isSeries,season,episode), rows=result.rows; torBody.empty();
                     tor.find('h2').text(isSeries ? 'Торренты · сезон ' + season : 'Торренты');
-                    if (isSeries) message(torBody, 'Явно неподходящие сезоны и серии скрыты. В раздачах сезона выберите серию в списке файлов; если сезон не указан, проверьте его.');
                     if (!rows.length) message(torBody, 'Подходящих раздач не найдено.');
                     rows.slice(0, 40).forEach(function (r) {
                         var bytes = Number(r.Size) || 0, size = bytes ? (bytes / 1073741824).toFixed(1) + ' ГБ' : '';
