@@ -1,7 +1,7 @@
 /* Simple Watch for Lampa. Local experimental plugin; no external telemetry. */
 (function (root) {
     'use strict';
-    var VERSION = '0.1.14';
+    var VERSION = '0.1.15';
     function movieKey(movie) { return (movie.source || 'tmdb') + ':' + (movie.original_name || movie.first_air_date || movie.name ? 'tv:' : 'movie:') + (movie.id || norm(movie.original_title || movie.original_name || movie.title || movie.name) + ':' + year(movie)); }
     function selectedEpisode(saved, requestedSeason, requestedEpisode) {
         var season = Number(requestedSeason) || Number(saved.season) || 1;
@@ -193,8 +193,11 @@
             if(status==='other') excluded++;
             else (status==='match' ? matches : unknown).push(row);
         });
-        function freshFirst(list) {return list.filter(hasFreshSeeds).concat(list.filter(function(r){return !hasFreshSeeds(r);}));}
-        return {rows:prioritizeTorrents(freshFirst(matches).concat(freshFirst(unknown)),record,identify), excluded:excluded};
+        var ranked=matches.concat(unknown).map(function(row,index) {
+            var stats=freshStats(row), count=stats.length ? stats[0].seeders : seedCount(row);
+            return {row:row,count:count===null ? -1 : count,index:index};
+        }).sort(function(a,b){return b.count-a.count || a.index-b.index;}).map(function(item){return item.row;});
+        return {rows:prioritizeTorrents(ranked,record,identify), excluded:excluded};
     }
     function usedTorrent(record,identity) {return record.torrent===identity || !!(record.torrentsUsed || {})[identity];}
     function prioritizeTorrents(rows,record,identify) {
@@ -211,10 +214,10 @@
         return ids;
     }
     function freshStats(row) {
-        return (row._kvnTracker || []).filter(function(s){return validCount(s.seeders) && s.at>0;});
+        return (row._kvnTracker || []).filter(function(s){return validCount(s.seeders) && s.at>0;})
+            .sort(function(a,b){return b.seeders-a.seeders;});
     }
     function validCount(v) {return typeof v==='number' && isFinite(v) && v>=0 && Math.floor(v)===v;}
-    function hasFreshSeeds(row) {return freshStats(row).some(function(s){return s.seeders>0;});}
     function seedLabel(row) {
         var stats=freshStats(row);
         if(stats.length) return stats.map(function(s){return 'Трекер '+s.host+': раздают '+s.seeders;}).join(' · ');
