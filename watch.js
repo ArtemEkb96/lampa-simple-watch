@@ -1,7 +1,7 @@
 /* Simple Watch for Lampa. Local experimental plugin; no external telemetry. */
 (function (root) {
     'use strict';
-    var VERSION = '0.1.17';
+    var VERSION = '0.1.18';
     function movieKey(movie) { return (movie.source || 'tmdb') + ':' + (movie.original_name || movie.first_air_date || movie.name ? 'tv:' : 'movie:') + (movie.id || norm(movie.original_title || movie.original_name || movie.title || movie.name) + ':' + year(movie)); }
     function selectedEpisode(saved, requestedSeason, requestedEpisode) {
         var season = Number(requestedSeason) || Number(saved.season) || 1;
@@ -178,7 +178,7 @@
         var listMatch=/сезон(?:а|ы|ов)?\s*[:№#]?\s*\d{1,2}\s*[,/+]\s*\d{1,2}/i.exec(text);
         if(listMatch && !/\d(?:\s*-?\s*(?:й|ый|ий|го|йо))?\s*$/.test(text.slice(0,listMatch.index))) return 'unknown';
         if(seasons.length && seasons.indexOf(Number(wantedSeason))<0) return 'other';
-        if(episodes.length && episodes.indexOf(Number(wantedEpisode))<0) return 'other';
+        if(Number(wantedEpisode)>0 && episodes.length && episodes.indexOf(Number(wantedEpisode))<0) return 'other';
         return seasons.length ? 'match' : 'unknown';
     }
     function seedCount(row) {
@@ -657,6 +657,8 @@
         var self = this, movie = object.movie || {}, dead = false, ready = false, active = false, last = null;
         var historyKey=historyStorage(movie), saved=historyRead(historyKey), selection=selectedEpisode(saved,object.season,object.episode);
         var season = selection.season, episode = selection.episode, isSeries = !!(movie.name || movie.first_air_date || movie.original_name);
+        // Playback history restores the episode, but only the filter menu enables episode filtering.
+        var episodeFilter = 0;
         var fx = new Filmix(), generation = 0, torrentGeneration = 0, allStreams = [], torrentRows = null, post = null, profile = null, torrentCollection, torrentSummary, accountButton, accountState = 'checking';
         var html = $('<div class="kvn-watch"></div>'), heading = $('<div class="kvn-heading"></div>').appendTo(html);
         $('<div class="kvn-title"></div>').text(movie.title || movie.name || 'Смотреть').appendTo(heading);
@@ -734,12 +736,15 @@
                 action(controls, 'Сезон ' + season, '', function () {
                     var ss = allStreams.map(function (r) { return r.season; }).filter(function (s, i, a) { return s > 0 && a.indexOf(s) === i; }).sort(function (a,b) { return a-b; });
                     if (!ss.length) for (var i = 1; i <= (movie.number_of_seasons || 1); i++) ss.push(i);
-                    choose('Сезон', ss.map(function (s) { return {title: 'Сезон ' + s, value: s}; }), function (v) { season = v.value; episode = 1; remember(); drawControls(); drawStreams(); loadTorrents(); });
+                    choose('Сезон', ss.map(function (s) { return {title: 'Сезон ' + s, value: s}; }), function (v) { season = v.value; episode = 1; episodeFilter = 0; remember(); drawControls(); drawStreams(); loadTorrents(); });
                 });
-                action(controls, 'Серия ' + episode, '', function () {
+                action(controls, episodeFilter ? 'Серия ' + episodeFilter : 'Выбрать серию', '', function () {
                     var es = allStreams.filter(function (r) { return r.season === season; }).map(function (r) { return r.episode; }).filter(function (e,i,a) { return e > 0 && a.indexOf(e) === i; }).sort(function (a,b) {return a-b;});
-                    if (!es.length) { L.Noty.show('Список серий появится после загрузки Filmix. В торрентах серия выбирается внутри раздачи.'); return; }
-                    choose('Серия', es.map(function (e) { return {title: episodeTitle(season,e), value: e}; }), function (v) { episode = v.value; remember(); drawControls(); drawStreams(); if (torrentRows) renderTorrents(); });
+                    choose('Фильтр по серии', [{title:'Все серии',value:0}].concat(es.map(function (e) { return {title: episodeTitle(season,e), value: e}; })), function (v) {
+                        episodeFilter = v.value;
+                        if(episodeFilter) {episode = episodeFilter; remember();}
+                        drawControls(); drawStreams(); if (torrentRows) renderTorrents();
+                    });
                 });
             }
             action(controls, 'Отметка просмотра', '', function () {
@@ -819,18 +824,18 @@
             }, function () { if (!dead && gen === generation) { accountState = 'unknown'; updateAccount(); filmError(); } });
         }
         function renderTorrents(showAll) {
-                    var result=displayTorrents(torrentRows || [],historyRead(historyKey),metadataIdentity,isSeries,season,episode), rows=result.rows; torBody.empty();
+                    var result=displayTorrents(torrentRows || [],historyRead(historyKey),metadataIdentity,isSeries,season,episodeFilter), rows=result.rows; torBody.empty();
                     tor.find('h2').text(isSeries ? 'Торренты · сезон ' + season : 'Торренты');
                     if (!rows.length) message(torBody, 'Подходящих раздач не найдено.');
                     rows.slice(0, showAll ? rows.length : 40).forEach(function (r) {
                         var bytes = Number(r.Size) || 0, size = bytes ? (bytes / 1073741824).toFixed(1) + ' ГБ' : '';
                         var identity=metadataIdentity(r);
-                        var match=isSeries ? torrentMatch(r.Title,season,episode) : 'match';
+                        var match=isSeries ? torrentMatch(r.Title,season,episodeFilter) : 'match';
                         var tile=action(torBody, r.Title || 'Раздача', [size, match==='unknown' ? 'Сезон не указан' : '', r.Tracker || ''].filter(Boolean).join(' · '), function () {
                             var hash=torrentInfoHash(r),choice=hash ? 'btih:'+hash : identity;
                             var used=Object.assign({},historyRead(historyKey).torrentsUsed || {});used[choice]=true;
                             remember({source:'Торренты',torrent:choice,torrentsUsed:used});pendingTorrent={key:historyKey,identity:identity};
-                            L.Torrent.back(function () {var recent=historyRead(historyKey);if(isSeries){season=recent.season || season;episode=recent.episode || episode;}drawControls();activate();}); L.Torrent.start(r, movie);
+                            L.Torrent.back(function () {var recent=historyRead(historyKey);if(isSeries){if(recent.season && recent.season!==season) episodeFilter=0;season=recent.season || season;episode=recent.episode || episode;}drawControls();activate();}); L.Torrent.start(r, movie);
                         });
                         var badges=$('<div class="kvn-tags"></div>').insertAfter(tile.find('.kvn-row-title'));
                         rowBadges(r,movie).forEach(function (b) {$('<span class="kvn-tag"></span>').addClass('kvn-tag-'+b.kind).text(b.label).appendTo(badges);});
@@ -862,7 +867,7 @@
             torrentCollection=createTorrentCollection({
                 searches:parserSearches(L.Storage,L.Utils,function(){return new L.Reguest();},function(p,ok,fail){L.Parser.get(p,ok,fail);},params),
                 probe:createTrackerProbe(L,root),includeUDP:true,
-                candidates:function(rows){return displayTorrents(rows,historyRead(historyKey),metadataIdentity,isSeries,season,episode).rows;},
+                candidates:function(rows){return displayTorrents(rows,historyRead(historyKey),metadataIdentity,isSeries,season,episodeFilter).rows;},
                 setTimeout:function(fn,ms){return setTimeout(fn,ms);},clearTimeout:function(id){clearTimeout(id);},now:Date.now,
                 ready:function(rows,summary){
                     if(dead || gen!==torrentGeneration) return;
@@ -879,6 +884,7 @@
                 var recent=selectedEpisode(historyRead(historyKey));
                 if(recent.season!==season || recent.episode!==episode) {
                     var changedSeason=recent.season!==season;
+                    if(changedSeason) episodeFilter=0;
                     season=recent.season;episode=recent.episode;drawControls();drawStreams();
                     if(changedSeason) loadTorrents(); else if(torrentRows) renderTorrents();
                 }
