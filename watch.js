@@ -1,7 +1,7 @@
 /* Simple Watch for Lampa. Local experimental plugin; no external telemetry. */
 (function (root) {
     'use strict';
-    var VERSION = '0.1.16';
+    var VERSION = '0.1.17';
     function movieKey(movie) { return (movie.source || 'tmdb') + ':' + (movie.original_name || movie.first_air_date || movie.name ? 'tv:' : 'movie:') + (movie.id || norm(movie.original_title || movie.original_name || movie.title || movie.name) + ':' + year(movie)); }
     function selectedEpisode(saved, requestedSeason, requestedEpisode) {
         var season = Number(requestedSeason) || Number(saved.season) || 1;
@@ -223,6 +223,26 @@
         if(stats.length) return stats.map(function(s){return 'Трекер '+s.host+': раздают '+s.seeders;}).join(' · ');
         var count=seedCount(row);
         return count===null ? 'Нет данных' : 'Раздают по данным сайта: '+count;
+    }
+    function trackerName(host) {
+        var name=String(host || '').toLowerCase(), known={
+            'opentor.net':'OpenTor','tracker.opentrackr.org':'OpenTrackr','open.stealth.si':'Stealth',
+            'tracker.torrent.eu.org':'Torrent.eu','torrent.by':'Torrent.by','tracker-udp.gbitt.info':'GBitt',
+            'tracker.renfei.net':'Renfei','exodus.desync.com':'Desync','evan.im':'Evan',
+            'torrent.tracker.durukanbal.com':'Durukan','ipv4.tracker.harry.lu':'Harry'
+        };
+        if(known[name]) return known[name];
+        name=name.replace(/^(?:(?:www|tracker(?:-udp)?|udp|open|ipv[46])\.)+/,'').split('.')[0] || 'Трекер';
+        return name.length>16 ? name.slice(0,15)+'…' : name;
+    }
+    function seedBadges(row) {
+        var stats=freshStats(row);
+        if(stats.length) return stats.map(function(s) {
+            return {count:s.seeders,label:trackerName(s.host),kind:s.seeders>0 ? 'live' : 'neutral',title:s.host};
+        });
+        var count=seedCount(row);
+        return [{count:count,label:count===null ? 'Нет данных' : 'Сайт',kind:count>0 ? 'site' : 'neutral',
+            title:count===null ? 'Нет данных' : 'По данным сайта'}];
     }
     // Only use tracker addresses supplied in magnets; never invent a UDP/HTTP mirror.
     function trackerSpecs(row,includeUDP) {
@@ -495,7 +515,7 @@
             return function(){network.clear();};
         };});
     }
-    var pure = {norm: norm, year: year, match: match, streams: streams, cap: cap, sortTorrents: sortTorrents, torrentInfoHash:torrentInfoHash, movieKey:movieKey, selectedEpisode:selectedEpisode, progressLabel:progressLabel, torrentBadges:torrentBadges,voiceMark:voiceMark,voiceSelection:voiceSelection,prioritizeTorrents:prioritizeTorrents,usedTorrent:usedTorrent,torrentMatch:torrentMatch,seedCount:seedCount,displayTorrents:displayTorrents,torrentIdentities:torrentIdentities,seedLabel:seedLabel,trackerSpecs:trackerSpecs,scrapeUrl:scrapeUrl,hashBinary:hashBinary,decodeScrape:decodeScrape,scrapeCounts:scrapeCounts,probeTracker:probeTracker,createTorrentCollection:createTorrentCollection,parserSearches:parserSearches,createTrackerProbe:createTrackerProbe,trackerBackend:trackerBackend,trackerHeaders:trackerHeaders};
+    var pure = {norm: norm, year: year, match: match, streams: streams, cap: cap, sortTorrents: sortTorrents, torrentInfoHash:torrentInfoHash, movieKey:movieKey, selectedEpisode:selectedEpisode, progressLabel:progressLabel, torrentBadges:torrentBadges,voiceMark:voiceMark,voiceSelection:voiceSelection,prioritizeTorrents:prioritizeTorrents,usedTorrent:usedTorrent,torrentMatch:torrentMatch,seedCount:seedCount,displayTorrents:displayTorrents,torrentIdentities:torrentIdentities,seedLabel:seedLabel,seedBadges:seedBadges,trackerName:trackerName,trackerSpecs:trackerSpecs,scrapeUrl:scrapeUrl,hashBinary:hashBinary,decodeScrape:decodeScrape,scrapeCounts:scrapeCounts,probeTracker:probeTracker,createTorrentCollection:createTorrentCollection,parserSearches:parserSearches,createTrackerProbe:createTrackerProbe,trackerBackend:trackerBackend,trackerHeaders:trackerHeaders};
     if (typeof module === 'object' && module.exports) { module.exports = pure; return; }
     if (root.KVNWatch) return;
     var L, $, API = 'http://filmixapp.cyou/api/v2/', watchCards = new WeakMap();
@@ -806,7 +826,7 @@
                         var bytes = Number(r.Size) || 0, size = bytes ? (bytes / 1073741824).toFixed(1) + ' ГБ' : '';
                         var identity=metadataIdentity(r);
                         var match=isSeries ? torrentMatch(r.Title,season,episode) : 'match';
-                        var tile=action(torBody, r.Title || 'Раздача', [size, seedLabel(r), match==='unknown' ? 'Сезон не указан' : '', r.Tracker || ''].filter(Boolean).join(' · '), function () {
+                        var tile=action(torBody, r.Title || 'Раздача', [size, match==='unknown' ? 'Сезон не указан' : '', r.Tracker || ''].filter(Boolean).join(' · '), function () {
                             var hash=torrentInfoHash(r),choice=hash ? 'btih:'+hash : identity;
                             var used=Object.assign({},historyRead(historyKey).torrentsUsed || {});used[choice]=true;
                             remember({source:'Торренты',torrent:choice,torrentsUsed:used});pendingTorrent={key:historyKey,identity:identity};
@@ -815,6 +835,14 @@
                         var badges=$('<div class="kvn-tags"></div>').insertAfter(tile.find('.kvn-row-title'));
                         rowBadges(r,movie).forEach(function (b) {$('<span class="kvn-tag"></span>').addClass('kvn-tag-'+b.kind).text(b.label).appendTo(badges);});
                         if(torrentIdentities(r,metadataIdentity).some(function(id){return usedTorrent(historyRead(historyKey),id);})) $('<span class="kvn-tag kvn-tag-history"></span>').text('Выбирали').appendTo(badges);
+                        var seeds=$('<div class="kvn-seeds"></div>').attr('aria-label',seedLabel(r)).insertAfter(badges);
+                        $('<span class="kvn-seeds-caption"></span>').text('Сиды').appendTo(seeds);
+                        seedBadges(r).forEach(function(s,index) {
+                            var badge=$('<span class="kvn-seed"></span>').addClass('kvn-seed-'+s.kind)
+                                .toggleClass('kvn-seed-main',index===0 && s.count!==null).attr('title',s.title).appendTo(seeds);
+                            if(s.count!==null) $('<b class="kvn-seed-number"></b>').text(s.count).appendTo(badge);
+                            $('<span class="kvn-seed-source"></span>').text(s.label).appendTo(badge);
+                        });
                     });
                     if(torrentSummary && (torrentSummary.pending || torrentSummary.failures)) message(torBody,'Показаны полученные результаты. Часть парсеров не ответила.');
                     if(!showAll && rows.length>40) action(torBody,'Показать остальные '+(rows.length-40),'',function(){renderTorrents(true);});
@@ -904,6 +932,7 @@
         $('<style>').text('.kvn-section h2{height:1.6em;line-height:1.6em;margin:0 0 .5em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.kvn-section .kvn-row{height:6.5em;box-sizing:border-box;display:flex;flex-direction:column;justify-content:center}.kvn-section .kvn-row-title{line-height:1.15;display:-webkit-box;-webkit-box-orient:vertical;-webkit-line-clamp:3;overflow:hidden}.kvn-section .kvn-detail{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;flex-shrink:0}.kvn-account-badge{display:inline-block;margin-left:.65em;padding:.15em .45em;border-radius:.4em;background:#20262c;font-size:.85em}').appendTo('head');
         $('<style>').text('.kvn-progress{font-size:.85em;color:#9dccff;min-height:1.5em;margin-bottom:.5em}.kvn-progress.kvn-done{color:#58df90}.kvn-section .kvn-row{height:8em}.kvn-tags{display:flex;gap:.3em;flex-wrap:wrap;margin:.35em 0 .1em;flex-shrink:0}.kvn-tag{font-size:.68em;line-height:1.35;padding:.14em .4em;border-radius:.3em;background:#343b49;color:#d6dbe5}.kvn-tag-quality{background:#253e66;color:#a5d0ff}.kvn-tag-hdr{background:#514226;color:#ffe090}.kvn-tag-codec{background:#40315f;color:#d6bcff}.kvn-tag-rate{background:#214a45;color:#9aead8}.kvn-tag-history{background:#245536;color:#a2edb7}').appendTo('head');
         $('<style>').text('.kvn-torrents .kvn-row{height:auto;min-height:8em}.kvn-torrents .kvn-detail{white-space:normal;overflow:visible;overflow-wrap:anywhere}').appendTo('head');
+        $('<style>').text('.kvn-seeds{display:flex;align-items:center;gap:.38em;flex-wrap:wrap;margin:.4em 0 .1em;flex-shrink:0}.kvn-seeds-caption{font-size:.72em;opacity:.7;margin-right:.1em}.kvn-seed{display:inline-flex;align-items:center;gap:.4em;line-height:1.2;padding:.18em .5em;border:1px solid transparent;border-radius:.4em;white-space:nowrap}.kvn-seed-number{font-size:1.05em;font-weight:700;font-variant-numeric:tabular-nums}.kvn-seed-source{font-size:.7em}.kvn-seed-main .kvn-seed-number{font-size:1.2em}.kvn-seed-live{background:#203f32;color:#a4edbb;border-color:#355b43}.kvn-seed-site{background:#293b53;color:#b4d6ff;border-color:#3b536f}.kvn-seed-neutral{background:#353b44;color:#bbc2cc}.kvn-row.focus .kvn-seed-live{background:#dcefe3;color:#205b34;border-color:#bddcc8}.kvn-row.focus .kvn-seed-site{background:#e0eafb;color:#284f81;border-color:#c3d6ee}.kvn-row.focus .kvn-seed-neutral{background:#e9edf2;color:#555e6b}').appendTo('head');
         L.Component.add('kvn_watch', Screen); installWatchRouting(); installHistory(); L.Listener.follow('full', attach);
         if (L.SettingsApi) {
             L.SettingsApi.addComponent({component: 'kvn_watch_settings', name: 'Простой просмотр', icon: '<svg viewBox="0 0 24 24"><path fill="currentColor" d="M7 3v18l14-9z"/></svg>'});
