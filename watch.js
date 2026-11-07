@@ -1,7 +1,7 @@
 /* Simple Watch for Lampa. Local experimental plugin; no external telemetry. */
 (function (root) {
     'use strict';
-    var VERSION = '0.1.11';
+    var VERSION = '0.1.14';
     function movieKey(movie) { return (movie.source || 'tmdb') + ':' + (movie.original_name || movie.first_air_date || movie.name ? 'tv:' : 'movie:') + (movie.id || norm(movie.original_title || movie.original_name || movie.title || movie.name) + ':' + year(movie)); }
     function selectedEpisode(saved, requestedSeason, requestedEpisode) {
         var season = Number(requestedSeason) || Number(saved.season) || 1;
@@ -108,12 +108,50 @@
         return rows;
     }
     function cap(profile) { return profile && profile.is_pro_plus ? 2160 : profile && profile.is_pro ? 1080 : 720; }
+    function torrentInfoHash(row) {
+        var hashes=[];
+        magnetValues(row,'xt').forEach(function(xt) {
+            var m=/^urn:btih:([a-f0-9]{40}|[a-z2-7]{32})$/i.exec(xt);
+            if(!m) return;
+            var hash=m[1].toLowerCase();
+            if(hash.length===32) {
+                var bits=0,value=0,hex='';
+                hash.toUpperCase().split('').forEach(function(c) {
+                    value=(value<<5)|'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567'.indexOf(c); bits+=5;
+                    if(bits>=8) { bits-=8; hex+=('0'+((value>>>bits)&255).toString(16)).slice(-2); }
+                });
+                hash=hex;
+            }
+            if(hashes.indexOf(hash)<0) hashes.push(hash);
+        });
+        return hashes.length===1 ? hashes[0] : null;
+    }
+    function magnetValues(row,key) {
+        var values=[];
+        [row.MagnetUri,row.magnet,row.downloadUrl,row.Link,row.Guid].forEach(function(uri) {
+            if(!/^magnet:\?/i.test(uri || '')) return;
+            String(uri).slice(8).split('&').forEach(function(part) {
+                var at=part.indexOf('=');
+                if(part.slice(0,at).toLowerCase()!==key) return;
+                try { var v=decodeURIComponent(part.slice(at+1)); if(values.indexOf(v)<0) values.push(v); } catch(e) {}
+            });
+        });
+        return values;
+    }
     function sortTorrents(rows) {
-        var seen = {};
-        return rows.filter(function (r) {
-            var key = r.MagnetUri || r.Guid || r.Link || (r.Title + ':' + r.Size);
-            if (seen[key]) return false; seen[key] = true; return true;
-        }).sort(function (a, b) { return (+b.Seeders || 0) - (+a.Seeders || 0); });
+        var seen=Object.create(null), merged=[];
+        rows.forEach(function(r) {
+            var hash=torrentInfoHash(r), key=hash && 'btih:'+hash, prev=key && seen[key];
+            if(prev) {
+                prev._kvnMembers=prev._kvnMembers.concat(r._kvnMembers || [r]);
+                if(seedCount(prev)===null && seedCount(r)!==null) {prev.Seeders=r.Seeders; prev.Peers=r.Peers;}
+            }
+            else {
+                var copy=Object.assign({},r,{_kvnMembers:(r._kvnMembers || [r]).slice()});
+                merged.push(copy); if(key) seen[key]=copy;
+            }
+        });
+        return merged.sort(function(a,b) {return (seedCount(b) || 0)-(seedCount(a) || 0);});
     }
     // Tracker titles are inconsistent. Reject only clearly identified wrong seasons or episodes.
     function torrentMatch(title, wantedSeason, wantedEpisode) {
@@ -155,15 +193,306 @@
             if(status==='other') excluded++;
             else (status==='match' ? matches : unknown).push(row);
         });
-        return {rows:prioritizeTorrents(matches,record,identify).concat(prioritizeTorrents(unknown,record,identify)), excluded:excluded};
+        function freshFirst(list) {return list.filter(hasFreshSeeds).concat(list.filter(function(r){return !hasFreshSeeds(r);}));}
+        return {rows:prioritizeTorrents(freshFirst(matches).concat(freshFirst(unknown)),record,identify), excluded:excluded};
     }
     function usedTorrent(record,identity) {return record.torrent===identity || !!(record.torrentsUsed || {})[identity];}
     function prioritizeTorrents(rows,record,identify) {
-        var used=[],other=[];
-        rows.forEach(function(row){(usedTorrent(record,identify(row)) ? used : other).push(row);});
-        return used.concat(other);
+        var latest=[],used=[],other=[];
+        rows.forEach(function(row){
+            var ids=torrentIdentities(row,identify);
+            (record.torrent && ids.indexOf(record.torrent)>=0 ? latest : ids.some(function(id){return usedTorrent(record,id);}) ? used : other).push(row);
+        });
+        return latest.concat(used,other);
     }
-    var pure = {norm: norm, year: year, match: match, streams: streams, cap: cap, sortTorrents: sortTorrents, movieKey:movieKey, selectedEpisode:selectedEpisode, progressLabel:progressLabel, torrentBadges:torrentBadges,voiceMark:voiceMark,voiceSelection:voiceSelection,prioritizeTorrents:prioritizeTorrents,usedTorrent:usedTorrent,torrentMatch:torrentMatch,seedCount:seedCount,displayTorrents:displayTorrents};
+    function torrentIdentities(row,identify) {
+        var ids=(row._kvnMembers || [row]).map(identify), hash=torrentInfoHash(row);
+        if(hash) ids.push('btih:'+hash);
+        return ids;
+    }
+    function freshStats(row) {
+        return (row._kvnTracker || []).filter(function(s){return validCount(s.seeders) && s.at>0;});
+    }
+    function validCount(v) {return typeof v==='number' && isFinite(v) && v>=0 && Math.floor(v)===v;}
+    function hasFreshSeeds(row) {return freshStats(row).some(function(s){return s.seeders>0;});}
+    function seedLabel(row) {
+        var stats=freshStats(row);
+        if(stats.length) return stats.map(function(s){return 'Трекер '+s.host+': раздают '+s.seeders;}).join(' · ');
+        var count=seedCount(row);
+        return count===null ? 'Нет данных' : 'Раздают по данным сайта: '+count;
+    }
+    // Only use tracker addresses supplied in magnets; never invent a UDP/HTTP mirror.
+    function trackerSpecs(row,includeUDP) {
+        var result=[],seen=Object.create(null);
+        (row._kvnMembers || [row]).forEach(function(member) {
+            magnetValues(member,'tr').forEach(function(address) {
+                try {
+                    var url=new URL(address);
+                    if(!/^(https?|wss?|udp):$/.test(url.protocol) || url.username || url.password) return;
+                    if(url.protocol==='udp:' && (!includeUDP || !url.port || url.search)) return;
+                    if(includeUDP && /(?:^localhost$|\.local$)/i.test(url.hostname)) return;
+                    if(/^http/.test(url.protocol)) {
+                        if(!/\/announce[^/]*$/.test(url.pathname)) return;
+                        url.pathname=url.pathname.replace(/\/announce([^/]*)$/,'/scrape$1');
+                    }
+                    url.hash='';
+                    if(seen[url.href]) return; seen[url.href]=true;
+                    result.push({url:url.href,host:url.hostname.replace(/^\[|\]$/g,''),ws:/^ws/.test(url.protocol),udp:url.protocol==='udp:'});
+                } catch(e) {}
+            });
+        });
+        if(includeUDP) result.sort(function(a,b){return Number(b.udp)-Number(a.udp);});
+        return result.slice(0,3);
+    }
+    function hashBinary(hash) {return hash.replace(/../g,function(pair){return String.fromCharCode(parseInt(pair,16));});}
+    function scrapeUrl(spec,hashes) {
+        return spec.url+(spec.url.indexOf('?')<0 ? '?' : '&')+hashes.map(function(hash){
+            return 'info_hash='+hash.match(/../g).map(function(pair){return '%'+pair;}).join('');
+        }).join('&');
+    }
+    // Bounded bencode reader, keeping binary dictionary keys byte-for-byte.
+    function decodeScrape(buffer) {
+        var bytes=new Uint8Array(buffer),pos=0,nodes=0;
+        if(!bytes.length || bytes.length>262144) throw Error('scrape size');
+        function read(depth) {
+            if(depth>12 || ++nodes>20000 || pos>=bytes.length) throw Error('scrape bounds');
+            var marker=bytes[pos++],value,end;
+            if(marker===100 || marker===108) {
+                value=marker===100 ? Object.create(null) : [];
+                while(bytes[pos]!==101) {
+                    if(marker===100) {var key=read(depth+1); if(typeof key!=='string') throw Error('scrape key'); value[key]=read(depth+1);}
+                    else value.push(read(depth+1));
+                    if(pos>=bytes.length) throw Error('scrape end');
+                }
+                pos++; return value;
+            }
+            if(marker===105) {
+                end=pos; while(end<bytes.length && bytes[end]!==101) end++;
+                if(end===bytes.length) throw Error('scrape int');
+                var text=''; while(pos<end) text+=String.fromCharCode(bytes[pos++]); pos++;
+                if(!/^(0|-?[1-9]\d*)$/.test(text) || !isFinite(Number(text))) throw Error('scrape int');
+                return Number(text);
+            }
+            var length=String.fromCharCode(marker);
+            while(pos<bytes.length && bytes[pos]!==58 && length.length<8) length+=String.fromCharCode(bytes[pos++]);
+            if(bytes[pos++]!==58 || !/^(0|[1-9]\d*)$/.test(length)) throw Error('scrape string');
+            end=pos+Number(length); if(end>bytes.length) throw Error('scrape string bounds');
+            value=''; while(pos<end) value+=String.fromCharCode(bytes[pos++]); return value;
+        }
+        var data=read(0); if(pos!==bytes.length) throw Error('scrape trailing'); return data;
+    }
+    function scrapeCounts(data,hashes) {
+        var result=Object.create(null);
+        if(!data || data['failure reason'] || data.failure_reason || !data.files) return result;
+        hashes.forEach(function(hash) {
+            var stat=data.files[hashBinary(hash)];
+            if(stat && validCount(stat.complete)) result[hash]=stat.complete;
+        });
+        return result;
+    }
+    function probeTracker(env,spec,hashes,done,budget) {
+        budget=Math.max(1,Math.min(4000,budget || 4000));
+        if(spec.udp) {done({});return function(){};}
+        var ended=false,channel,timer=env.setTimeout(function(){finish({});},budget);
+        function cancel() {
+            env.clearTimeout(timer);
+            if(channel) {channel.onload=channel.onerror=channel.onabort=channel.onclose=channel.onmessage=channel.onopen=channel.onprogress=channel.ontimeout=null;
+                try {if(spec.ws) channel.close(); else channel.abort();} catch(e) {}}
+        }
+        function finish(counts) {if(ended) return; ended=true; cancel(); done(counts);}
+        try {
+            if(spec.ws) {
+                channel=new env.WebSocket(spec.url);
+                channel.onopen=function(){channel.send(JSON.stringify({action:'scrape',info_hash:hashes.map(hashBinary)}));};
+                channel.onmessage=function(event){
+                    try {if(typeof event.data!=='string' || event.data.length>262144) return finish({});
+                        var data=JSON.parse(event.data); if(data.action==='scrape') finish(scrapeCounts(data,hashes));
+                    } catch(e) {finish({});}
+                };
+                channel.onerror=channel.onclose=function(){finish({});};
+            } else {
+                channel=new env.XMLHttpRequest(); channel.open('GET',scrapeUrl(spec,hashes),true); channel.responseType='arraybuffer'; channel.timeout=budget;
+                channel.onprogress=function(event){if(event.loaded>262144) finish({});};
+                channel.onload=function(){try {finish(channel.status===200 ? scrapeCounts(decodeScrape(channel.response),hashes) : {});} catch(e) {finish({});}};
+                channel.onerror=channel.ontimeout=channel.onabort=function(){finish({});}; channel.send();
+            }
+        } catch(e) {finish({});}
+        return function(){ended=true; cancel();};
+    }
+    function trackerBackend(L) {
+        try {
+            var storage=L.Storage,one=storage.get('torrserver_url',''),two=storage.get('torrserver_url_two','');
+            var raw=L.Torserver && L.Torserver.url ? L.Torserver.url() : storage.field('torrserver_use_link')==='two' ? two || one : one || two;
+            if(!raw) return null;
+            var url=new URL(L.Utils.checkEmptyUrl(raw));
+            if(!/^https?:$/.test(url.protocol) || url.username || url.password || url.search || url.hash) return null;
+            return url.href.replace(/\/+$/,'');
+        } catch(e) {return null;}
+    }
+    function trackerHeaders(L,env) {
+        var headers={'Content-Type':'application/json',Accept:'application/json'};
+        if(L.Storage.field('torrserver_auth')) {
+            var password=L.Storage.value ? L.Storage.value('torrserver_password') : L.Storage.get('torrserver_password','');
+            var text=encodeURIComponent(L.Storage.get('torrserver_login','')+':'+password).replace(/%([0-9A-F]{2})/g,function(_,h){return String.fromCharCode(parseInt(h,16));});
+            headers.Authorization='Basic '+env.btoa(text);
+        }
+        return headers;
+    }
+    // One capability discovery per opening; all HTTP/UDP batches use the selected LT.
+    function createTrackerProbe(L,env) {
+        var base=trackerBackend(L),state=base ? 'new' : 'absent',waiting=[],capNetwork,capTimer;
+        var now=env.now || Date.now;
+        function discovered(available) {
+            if(state!=='loading') return;
+            state=available ? 'ready' : 'absent';env.clearTimeout(capTimer);if(capNetwork) capNetwork.clear();
+            var callbacks=waiting;waiting=[];callbacks.forEach(function(fn){fn();});
+        }
+        function discover(next) {
+            if(state==='ready' || state==='absent') return next();
+            waiting.push(next);if(state==='loading') return;state='loading';
+            capTimer=env.setTimeout(function(){discovered(false);},700);
+            try {
+                capNetwork=new L.Reguest();capNetwork.timeout(700);
+                capNetwork.native(base+'/kvn/trackers/capabilities',function(data){
+                    discovered(!!(data && data.version===1 && Array.isArray(data.protocols) && data.protocols.indexOf('udp')>=0));
+                },function(){discovered(false);},null,{headers:trackerHeaders(L,env)});
+            } catch(e) {discovered(false);}
+        }
+        function probe(spec,hashes,done,budget) {
+            var ended=false,network,stopDirect,started=now();budget=Math.max(1,Math.min(4000,budget || 4000));
+            var timer=env.setTimeout(function(){finish({});},budget);
+            function clean() {env.clearTimeout(timer);if(network) network.clear();if(stopDirect) stopDirect();}
+            function finish(counts) {if(ended) return;ended=true;clean();done(counts);}
+            function run() {
+                if(ended) return;
+                var remaining=Math.floor(budget-(now()-started));if(remaining<1) return finish({});
+                if(spec.ws || state!=='ready') {
+                    if(spec.udp) return finish({});
+                    stopDirect=probeTracker(env,spec,hashes,finish,remaining);return;
+                }
+                try {
+                    network=new L.Reguest();network.timeout(remaining);
+                    var payload=JSON.stringify({version:1,tracker:spec.url,hashes:hashes,budget_ms:remaining});
+                    network.native(base+'/kvn/trackers/scrape',function(data){
+                        var counts=Object.create(null),seen=Object.create(null);
+                        if(data && data.version===1 && data.host===spec.host && Array.isArray(data.results) && data.results.length<=20) {
+                            data.results.forEach(function(r){if(r && r.status==='ok' && hashes.indexOf(r.hash)>=0 && validCount(r.seeders) && r.checked_at>0) {
+                                if(seen[r.hash]) {delete counts[r.hash];} else {counts[r.hash]=r.seeders;} seen[r.hash]=true;
+                            }});
+                        }
+                        finish(counts);
+                    },function(){finish({});},payload,{headers:trackerHeaders(L,env)});
+                } catch(e) {finish({});}
+            }
+            if(spec.ws) run();else discover(run);
+            return function(){ended=true;clean();};
+        }
+        probe.cancel=function(){waiting=[];if(capNetwork) capNetwork.clear();env.clearTimeout(capTimer);state='absent';};
+        return probe;
+    }
+    // All callbacks belong to one collection. Opening/cancelling seals it permanently.
+    function createTorrentCollection(options) {
+        var rows=[],stats=Object.create(null),seen=Object.create(null),queue=[],stops=[],running=0,pending=options.searches.length;
+        var sealed=false,started=false,launching=false,timer,successes=0,failures=0,deadline;
+        function rememberStop(stop) {if(typeof stop==='function') {if(sealed) stop(); else stops.push(stop);}}
+        function cancelWork() {options.clearTimeout(timer); stops.forEach(function(stop){try {stop();} catch(e) {}});if(options.probe.cancel) options.probe.cancel();}
+        function snapshot() {
+            return sortTorrents(rows).map(function(row) {
+                return Object.assign({},row,{_kvnTracker:(stats[torrentInfoHash(row)] || []).map(function(s){return Object.assign({},s);})});
+            });
+        }
+        function show() {if(sealed) return; sealed=true; var result=snapshot(); cancelWork(); options.ready(result,{successes:successes,failures:failures,pending:pending});}
+        function complete() {if(!launching && !pending && !running && !queue.length) show();}
+        function pump() {
+            if(sealed) return;
+            while(running<3 && queue.length) {
+                var budget=Math.min(4000,deadline-options.now());if(budget<=0) {show();return;}
+                (function(task) {
+                    running++; var answered=false;
+                    function finish(counts) {
+                        if(sealed || answered) return; answered=true;
+                        task.hashes.forEach(function(hash) {if(validCount(counts[hash])) {
+                            (stats[hash] || (stats[hash]=[])).push({host:task.spec.host,seeders:counts[hash],at:options.now()});
+                        }});
+                        running--; pump();
+                    }
+                    try {rememberStop(options.probe(task.spec,task.hashes,finish,budget));} catch(e) {finish({});}
+                })(queue.shift());
+            }
+            complete();
+        }
+        function enqueue() {
+            var groups=Object.create(null);
+            options.candidates(sortTorrents(rows)).slice(0,80).forEach(function(row) {
+                var hash=torrentInfoHash(row); if(!hash) return;
+                trackerSpecs(row,options.includeUDP).forEach(function(spec) {
+                    var key=spec.url+'|'+hash; if(seen[key]) return; seen[key]=true;
+                    var group=groups[spec.url] || (groups[spec.url]={spec:spec,hashes:[]}); group.hashes.push(hash);
+                });
+            });
+            Object.keys(groups).forEach(function(key) {
+                var group=groups[key]; for(var i=0;i<group.hashes.length;i+=20) queue.push({spec:group.spec,hashes:group.hashes.slice(i,i+20)});
+            });
+        }
+        return {
+            start:function() {
+                if(started || sealed) return; started=true; launching=true; deadline=options.now()+15000;timer=options.setTimeout(show,15000);
+                options.searches.forEach(function(search) {
+                    if(sealed) return;
+                    var answered=false;
+                    function finish(items) {
+                        if(sealed || answered) return; answered=true; pending--;
+                        if(Array.isArray(items)) {successes++; rows=rows.concat(items); enqueue();} else failures++;
+                        pump();
+                    }
+                    try {rememberStop(search(finish));} catch(e) {finish(null);}
+                });
+                launching=false; complete();
+            },
+            show:show,
+            cancel:function(){if(sealed) return; sealed=true; cancelWork();}
+        };
+    }
+    function parserSearches(storage,utils,makeRequest,fallback,params) {
+        var type=storage.field('parser_torrent_type') || 'jackett';
+        if(type!=='jackett' && type!=='prowlarr') return [function(done){fallback(params,function(data){done(data && data.Results);},function(){done(null);});}];
+        var links=[],seen=Object.create(null);
+        ['', '_two'].forEach(function(suffix,rank) {
+            var raw=String(storage.field(type+'_url'+suffix) || '').trim(); if(!raw) return;
+            if(type==='jackett') raw=raw.replace('jacred.xyz','jac.red');
+            var base=utils.checkEmptyUrl(raw).replace(/\/+$/,''),key=storage.field(type+'_key'+suffix) || '';
+            var id=base+'|'+key; if(seen[id]) return; seen[id]=true;
+            links.push({base:base,key:key,rank:rank});
+        });
+        return links.map(function(link) {return function(done) {
+            var network=makeRequest(),m=params.movie,url;
+            if(type==='jackett') {
+                url=link.base+'/api/v2.0/indexers/'+(storage.field('jackett_interview')==='healthy' ? 'status:healthy' : 'all')+'/results?apikey='+encodeURIComponent(link.key)+'&Query='+encodeURIComponent(params.search);
+                url+='&title='+encodeURIComponent(m.title)+'&title_original='+encodeURIComponent(m.original_title);
+                url+='&year='+encodeURIComponent(String(m.first_air_date || m.release_date || '0000').slice(0,4));
+                url+='&is_serial='+(m.original_name ? '2' : '1')+'&genres='+encodeURIComponent((m.genres || []).map(function(g){return g.name;}).join(','));
+                url+='&Category[]='+(m.number_of_seasons>0 ? '5000' : '2000');
+                if(/^(ja|zh)$/.test(m.original_language || '') && (m.genres || []).some(function(g){return g.id===16;})) url+=',5070';
+            } else {
+                url=link.base+'/api/v1/search?apikey='+encodeURIComponent(link.key)+'&query='+encodeURIComponent(params.search)+'&type='+(m.original_name ? 'tvsearch' : 'search')+'&categories='+(m.number_of_seasons>0 ? '5000' : '2000');
+                if(/^(ja|zh)$/.test(m.original_language || '') && (m.genres || []).some(function(g){return g.id===16;})) url+='&categories=5070';
+            }
+            network.timeout(15000);
+            network.native(url,function(data) {
+                var items;
+                if(type==='jackett') items=data && data.Results;
+                else if(Array.isArray(data)) items=data.filter(function(r){return r.protocol==='torrent';}).map(function(r){return {
+                    Title:r.title,Tracker:r.indexer,Size:r.size,PublishDate:r.publishDate,Seeders:r.seeders,Peers:r.leechers,MagnetUri:r.magnetUrl || (/^magnet:/i.test(r.downloadUrl || '') ? r.downloadUrl : ''),Link:r.downloadUrl
+                };});
+                if(!Array.isArray(items)) return done(null);
+                done(items.filter(function(r){return r && typeof r==='object' && !Array.isArray(r);}).map(function(r){return Object.assign({},r,{
+                    hash:utils.hash(r.Title),size:utils.bytesToSize(r.Size),PublisTime:utils.strToTime(r.PublishDate),source_rank:link.rank
+                });}));
+            },function(){done(null);});
+            return function(){network.clear();};
+        };});
+    }
+    var pure = {norm: norm, year: year, match: match, streams: streams, cap: cap, sortTorrents: sortTorrents, torrentInfoHash:torrentInfoHash, movieKey:movieKey, selectedEpisode:selectedEpisode, progressLabel:progressLabel, torrentBadges:torrentBadges,voiceMark:voiceMark,voiceSelection:voiceSelection,prioritizeTorrents:prioritizeTorrents,usedTorrent:usedTorrent,torrentMatch:torrentMatch,seedCount:seedCount,displayTorrents:displayTorrents,torrentIdentities:torrentIdentities,seedLabel:seedLabel,trackerSpecs:trackerSpecs,scrapeUrl:scrapeUrl,hashBinary:hashBinary,decodeScrape:decodeScrape,scrapeCounts:scrapeCounts,probeTracker:probeTracker,createTorrentCollection:createTorrentCollection,parserSearches:parserSearches,createTrackerProbe:createTrackerProbe,trackerBackend:trackerBackend,trackerHeaders:trackerHeaders};
     if (typeof module === 'object' && module.exports) { module.exports = pure; return; }
     if (root.KVNWatch) return;
     var L, $, API = 'http://filmixapp.cyou/api/v2/', watchCards = new WeakMap();
@@ -305,13 +634,14 @@
         var self = this, movie = object.movie || {}, dead = false, ready = false, active = false, last = null;
         var historyKey=historyStorage(movie), saved=historyRead(historyKey), selection=selectedEpisode(saved,object.season,object.episode);
         var season = selection.season, episode = selection.episode, isSeries = !!(movie.name || movie.first_air_date || movie.original_name);
-        var fx = new Filmix(), generation = 0, torrentGeneration = 0, allStreams = [], torrentRows = null, post = null, profile = null, torrentTimer, accountButton, accountState = 'checking';
+        var fx = new Filmix(), generation = 0, torrentGeneration = 0, allStreams = [], torrentRows = null, post = null, profile = null, torrentCollection, torrentSummary, accountButton, accountState = 'checking';
         var html = $('<div class="kvn-watch"></div>'), heading = $('<div class="kvn-heading"></div>').appendTo(html);
         $('<div class="kvn-title"></div>').text(movie.title || movie.name || 'Смотреть').appendTo(heading);
         var controls = $('<div class="kvn-controls"></div>').appendTo(heading);
         var progress = $('<div class="kvn-progress"></div>').appendTo(heading);
         var scroll = new L.Scroll({mask: true, over: true}); html.append(scroll.render()); scroll.minus(heading);
         var film = $('<section class="kvn-section"><h2>Filmix</h2></section>'), tor = $('<section class="kvn-section"><h2>Торренты</h2></section>');
+        tor.addClass('kvn-torrents');
         var columns = $('<div style="display:flex;gap:1.2em;align-items:flex-start"></div>');
         film.css({width:'44%',minWidth:0}); tor.css({width:'56%',minWidth:0});
         columns.append(film).append(tor); scroll.append(columns);
@@ -465,42 +795,51 @@
                 }, function () { if (!dead && gen === generation) filmError(); });
             }, function () { if (!dead && gen === generation) { accountState = 'unknown'; updateAccount(); filmError(); } });
         }
-        function renderTorrents() {
+        function renderTorrents(showAll) {
                     var result=displayTorrents(torrentRows || [],historyRead(historyKey),metadataIdentity,isSeries,season,episode), rows=result.rows; torBody.empty();
                     tor.find('h2').text(isSeries ? 'Торренты · сезон ' + season : 'Торренты');
                     if (!rows.length) message(torBody, 'Подходящих раздач не найдено.');
-                    rows.slice(0, 40).forEach(function (r) {
+                    rows.slice(0, showAll ? rows.length : 40).forEach(function (r) {
                         var bytes = Number(r.Size) || 0, size = bytes ? (bytes / 1073741824).toFixed(1) + ' ГБ' : '';
                         var identity=metadataIdentity(r);
-                        var seeds=seedCount(r), match=isSeries ? torrentMatch(r.Title,season,episode) : 'match';
-                        var tile=action(torBody, r.Title || 'Раздача', [size, seeds===null ? 'Раздают: нет данных' : 'Раздают по данным сайта: ' + seeds, match==='unknown' ? 'Сезон не указан' : '', r.Tracker || ''].filter(Boolean).join(' · '), function () {
-                            var used=Object.assign({},historyRead(historyKey).torrentsUsed || {});used[identity]=true;
-                            remember({source:'Торренты',torrent:identity,torrentsUsed:used});pendingTorrent={key:historyKey,identity:identity};
+                        var match=isSeries ? torrentMatch(r.Title,season,episode) : 'match';
+                        var tile=action(torBody, r.Title || 'Раздача', [size, seedLabel(r), match==='unknown' ? 'Сезон не указан' : '', r.Tracker || ''].filter(Boolean).join(' · '), function () {
+                            var hash=torrentInfoHash(r),choice=hash ? 'btih:'+hash : identity;
+                            var used=Object.assign({},historyRead(historyKey).torrentsUsed || {});used[choice]=true;
+                            remember({source:'Торренты',torrent:choice,torrentsUsed:used});pendingTorrent={key:historyKey,identity:identity};
                             L.Torrent.back(function () {var recent=historyRead(historyKey);if(isSeries){season=recent.season || season;episode=recent.episode || episode;}drawControls();activate();}); L.Torrent.start(r, movie);
                         });
                         var badges=$('<div class="kvn-tags"></div>').insertAfter(tile.find('.kvn-row-title'));
                         rowBadges(r,movie).forEach(function (b) {$('<span class="kvn-tag"></span>').addClass('kvn-tag-'+b.kind).text(b.label).appendTo(badges);});
-                        if(usedTorrent(historyRead(historyKey),identity)) $('<span class="kvn-tag kvn-tag-history"></span>').text('Выбирали').appendTo(badges);
+                        if(torrentIdentities(r,metadataIdentity).some(function(id){return usedTorrent(historyRead(historyKey),id);})) $('<span class="kvn-tag kvn-tag-history"></span>').text('Выбирали').appendTo(badges);
                     });
+                    if(torrentSummary && (torrentSummary.pending || torrentSummary.failures)) message(torBody,'Показаны полученные результаты. Часть парсеров не ответила.');
+                    if(!showAll && rows.length>40) action(torBody,'Показать остальные '+(rows.length-40),'',function(){renderTorrents(true);});
                     refreshFocus();
         }
         function loadTorrents() {
-            clearTimeout(torrentTimer);
-            var gen = ++torrentGeneration, ended = false;
-            torrentRows = null; torBody.empty(); message(torBody, 'Ищем раздачи…');
-            function fail() { if (dead || gen !== torrentGeneration || ended) return; clearTimeout(torrentTimer); ended = true; torBody.empty(); message(torBody, 'Поиск торрентов не ответил. Filmix работает независимо.'); action(torBody, 'Повторить поиск', '', loadTorrents); refreshFocus(); report('torrent_error'); }
-            var timeout = torrentTimer = setTimeout(fail, 45000);
+            if(torrentCollection) torrentCollection.cancel();
+            var gen = ++torrentGeneration;
+            torrentRows = null; torrentSummary=null; torBody.empty(); message(torBody, 'Собираем раздачи и уточняем данные трекеров… До 15 секунд.');
+            action(torBody,'Показать сейчас','Открыть уже полученные результаты',function(){if(torrentCollection) torrentCollection.show();});
+            refreshFocus();
             var suffix = isSeries ? ' S' + ('0' + season).slice(-2) : '';
             var m = Object.assign({genres: []}, movie);
             m.genres = m.genres || [];
             m.title = m.title || m.name; m.original_title = m.original_title || m.original_name || m.title;
-            try {
-                L.Parser.get({movie: m, search: m.original_title + suffix, search_one: m.title + suffix, search_two: m.original_title + suffix, page: 1}, function (data) {
-                    clearTimeout(timeout); if (dead || gen !== torrentGeneration || ended) return; ended = true;
-                    torrentRows = data && data.Results || []; renderTorrents();
-                    report('torrent_results', {count: torrentRows.length});
-                }, fail);
-            } catch (e) { fail(); }
+            var params={movie:m,search:m.original_title+suffix,search_one:m.title+suffix,search_two:m.original_title+suffix,page:1};
+            torrentCollection=createTorrentCollection({
+                searches:parserSearches(L.Storage,L.Utils,function(){return new L.Reguest();},function(p,ok,fail){L.Parser.get(p,ok,fail);},params),
+                probe:createTrackerProbe(L,root),includeUDP:true,
+                candidates:function(rows){return displayTorrents(rows,historyRead(historyKey),metadataIdentity,isSeries,season,episode).rows;},
+                setTimeout:function(fn,ms){return setTimeout(fn,ms);},clearTimeout:function(id){clearTimeout(id);},now:Date.now,
+                ready:function(rows,summary){
+                    if(dead || gen!==torrentGeneration) return;
+                    torrentRows=rows; torrentSummary=summary; renderTorrents();
+                    if(!rows.length) {action(torBody,'Повторить поиск','',loadTorrents); refreshFocus();}
+                }
+            });
+            torrentCollection.start();
         }
         this.create = function () { return html; };
         this.render = function () { return html; };
@@ -517,7 +856,7 @@
         };
         this.pause = function () { active = false; };
         this.stop = function () { active = false; };
-        this.destroy = function () { dead = true; active = false; clearTimeout(torrentTimer); fx.destroy(); scroll.destroy(); html.remove(); };
+        this.destroy = function () { dead = true; active = false; if(torrentCollection) torrentCollection.cancel(); fx.destroy(); scroll.destroy(); html.remove(); };
     }
     function open(movie, context) { L.Activity.push({component: 'kvn_watch', title: 'Смотреть', movie: movie, season: context && context.season, episode: context && context.episode, page: 1}); }
     function attach(e) {
@@ -561,6 +900,7 @@
         $('<style>').text('.kvn-watch{height:100%;padding:1.4em 2em;box-sizing:border-box}.kvn-title{font-size:1.8em;font-weight:600;margin-bottom:.6em}.kvn-controls{display:flex;gap:.65em;margin-bottom:1em}.kvn-row{padding:.85em 1em;border-radius:.65em;background:rgba(255,255,255,.08);margin:.4em 0}.kvn-row.focus{background:#fff;color:#141820}.kvn-row-title{font-size:1.05em}.kvn-detail{opacity:.65;font-size:.8em;margin-top:.3em}.kvn-controls .kvn-row{font-size:.85em}.kvn-section{margin-bottom:1.6em}.kvn-section h2{font-size:1.3em;margin:0 0 .5em}.kvn-message{opacity:.72;padding:.6em 0 1em}.kvn-auth{line-height:1.5}').appendTo('head');
         $('<style>').text('.kvn-section h2{height:1.6em;line-height:1.6em;margin:0 0 .5em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.kvn-section .kvn-row{height:6.5em;box-sizing:border-box;display:flex;flex-direction:column;justify-content:center}.kvn-section .kvn-row-title{line-height:1.15;display:-webkit-box;-webkit-box-orient:vertical;-webkit-line-clamp:3;overflow:hidden}.kvn-section .kvn-detail{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;flex-shrink:0}.kvn-account-badge{display:inline-block;margin-left:.65em;padding:.15em .45em;border-radius:.4em;background:#20262c;font-size:.85em}').appendTo('head');
         $('<style>').text('.kvn-progress{font-size:.85em;color:#9dccff;min-height:1.5em;margin-bottom:.5em}.kvn-progress.kvn-done{color:#58df90}.kvn-section .kvn-row{height:8em}.kvn-tags{display:flex;gap:.3em;flex-wrap:wrap;margin:.35em 0 .1em;flex-shrink:0}.kvn-tag{font-size:.68em;line-height:1.35;padding:.14em .4em;border-radius:.3em;background:#343b49;color:#d6dbe5}.kvn-tag-quality{background:#253e66;color:#a5d0ff}.kvn-tag-hdr{background:#514226;color:#ffe090}.kvn-tag-codec{background:#40315f;color:#d6bcff}.kvn-tag-rate{background:#214a45;color:#9aead8}.kvn-tag-history{background:#245536;color:#a2edb7}').appendTo('head');
+        $('<style>').text('.kvn-torrents .kvn-row{height:auto;min-height:8em}.kvn-torrents .kvn-detail{white-space:normal;overflow:visible;overflow-wrap:anywhere}').appendTo('head');
         L.Component.add('kvn_watch', Screen); installWatchRouting(); installHistory(); L.Listener.follow('full', attach);
         if (L.SettingsApi) {
             L.SettingsApi.addComponent({component: 'kvn_watch_settings', name: 'Простой просмотр', icon: '<svg viewBox="0 0 24 24"><path fill="currentColor" d="M7 3v18l14-9z"/></svg>'});
